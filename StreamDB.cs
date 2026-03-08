@@ -4,6 +4,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using FASTER.core;
 using Microsoft.Data.Sqlite;
+using WebServer.Utilities;
 
 namespace WebServer.Storage
 {
@@ -48,7 +49,8 @@ namespace WebServer.Storage
         };
 
         // Now I only need to move this slider which points to readonly data.
-        // Since int is atomic I can do this without even interlocked kewl
+        // Since int is atomic I can do this without even interlocked.
+        // This can be changed without any synchronization.
         private int _adaptiveIdx = 3;
 
         // Bounded queue parameters
@@ -76,7 +78,13 @@ namespace WebServer.Storage
         private readonly ManualResetEventSlim _flushSignal = new(false);
         private readonly ManualResetEventSlim _flushWorkerIdle = new(true); // Set when idle, reset when active
         private readonly Lock _maintenanceLock = new(); // Ensures only one maintenance operation at a time
-        private int _indexWritesDisabled = 0; // 0 = enabled, 1 = disabled; use Interlocked for memory barriers
+
+        // 0 = enabled, 1 = disabled; use Interlocked for memory barriers. This let's me write non-blocking synchronization between the flush worker and the checkpointing logic to ensure we never write to SQLite during a checkpoint.
+        private int _indexWritesDisabled = 0; 
+
+        // Interlocked counter for pending index inserts. This is cheaper than calling _pendingIndexInserts.Count which is O(n) on ConcurrentQueue.
+        private int _pendingIndexCount = 0; 
+
         private bool _disposed;
 
         // Statistics tracking
@@ -268,10 +276,13 @@ namespace WebServer.Storage
                                 */
                                 if (Interlocked.CompareExchange(ref _indexWritesDisabled, 0, 0) != 0)
                                 {
-                                    // Re-enqueue the entry we just dequeued
+                                    // Re-enqueue the entry we just dequeued (no count change needed)
                                     _pendingIndexInserts.Enqueue(entry);
                                     break;
                                 }
+
+                                // Successfully dequeued and will process - decrement count
+                                Interlocked.Decrement(ref _pendingIndexCount);
 
                                 pDid.Value = entry.DeviceId;
                                 pTs.Value = entry.Timestamp;
@@ -305,7 +316,7 @@ namespace WebServer.Storage
         /// </summary>
         private void AdaptivelyTuneParameters()
         {
-            int queueDepth = _pendingIndexInserts.Count;
+            int queueDepth = Volatile.Read(ref _pendingIndexCount);
             int currAdaptiveIdx = Volatile.Read(ref _adaptiveIdx);
 
             // More aggressive scaling: consider medium pressure zone
@@ -354,17 +365,19 @@ namespace WebServer.Storage
             {
                 // Soft-bounded queue: check count for backpressure (eventually consistent)
                 // Race condition is acceptable - queue may briefly exceed capacity before settling
-                int currentCount = _pendingIndexInserts.Count;
+                int currentCount = Volatile.Read(ref _pendingIndexCount);
                 if (currentCount < QueueCapacity)
                 {
                     _pendingIndexInserts.Enqueue((deviceId, timestamp, address));
+                    Interlocked.Increment(ref _pendingIndexCount);
                     // in aggressive scenarios as index frequency goes down we want to make sure the worker is signaled to process the larger batches in a timely manner
                     _flushSignal.Set();
                 }
                 else
                 {
                     // Queue is full - drop this index entry
-                    // This is acceptable because we have sparse indexing and can always scan from a previous entry
+                    // This is acceptable because we have sparse indexing and can always scan from a previous entry.
+                    // This is however not desired because it fucks up the time complexity of making queries
                     Interlocked.Increment(ref _droppedIndexEntries);
                 }
             }
@@ -395,16 +408,13 @@ namespace WebServer.Storage
         /// <summary>
         /// Get statistics about adaptive tuning and index queue behavior.
         /// </summary>
-        public (long ScaleUpCount, long ScaleDownCount, long DroppedIndexEntries, int CurrentAdaptiveIdx, int CurrentQueueDepth) GetStats()
-        {
-            return (
+        public StreamDbStats GetStats() => new StreamDbStats(
                 Volatile.Read(ref _scaleUpCount),
                 Volatile.Read(ref _scaleDownCount),
                 Volatile.Read(ref _droppedIndexEntries),
                 Volatile.Read(ref _adaptiveIdx),
-                _pendingIndexInserts.Count
+                Volatile.Read(ref _pendingIndexCount)
             );
-        }
 
         #endregion
 
@@ -653,7 +663,7 @@ namespace WebServer.Storage
 
                 if (!_pendingIndexInserts.IsEmpty)
                 {
-                    _logger?.LogWarning("RunCheckpoint: proceeding with {Count} pending index entries still queued", _pendingIndexInserts.Count);
+                    _logger?.LogWarning("RunCheckpoint: proceeding with {Count} pending index entries still queued", Volatile.Read(ref _pendingIndexCount));
                 }
 
                 try
@@ -1118,5 +1128,8 @@ namespace WebServer.Storage
                 _log.Dispose();
             }
         }
+
     }
+
+    public record class StreamDbStats(long ScaleUp, long ScaleDown, long Dropped, int AdaptiveIdx, long PendingIdxQueueLen);
 }
