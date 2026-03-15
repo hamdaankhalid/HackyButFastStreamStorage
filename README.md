@@ -267,7 +267,6 @@ For each shard:
 ## Performance Characteristics
 
 ### Write Performance
-- **Latency**: ~50-100μs per append (in-memory)
 - **Throughput**: Limited by FasterLog (hundreds of thousands/sec per shard)
 - **Batching**: Amortizes SQLite overhead across entries
 
