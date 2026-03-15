@@ -4,7 +4,6 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using FASTER.core;
 using Microsoft.Data.Sqlite;
-using WebServer.Utilities;
 
 namespace WebServer.Storage
 {
@@ -41,22 +40,23 @@ namespace WebServer.Storage
             (1 << 4, 1 << 3, (1 << 4) - 1),    // idx 0: high frequency, small batches
             (1 << 5, 1 << 4, (1 << 5) - 1),   // idx 1
             (1 << 6, 1 << 5, (1 << 6) - 1),   // idx 2
-            (1 << 7, 1 << 6, (1 << 7) - 1),   // idx 3 (default)
+            (1 << 7, 1 << 6, (1 << 7) - 1),   // idx 3
             (1 << 8, 1 << 7, (1 << 8) - 1),  // idx 4
             (1 << 9, 1 << 8, (1 << 9) - 1),  // idx 5
             (1 << 10, 1 << 9, (1 << 10) - 1), // idx 6: low frequency, big batches
-            (1 << 11, 1 << 10, (1 << 11) - 1) // idx 7: very low frequency, very big batches
+            (1 << 11, 1 << 10, (1 << 11) - 1), // idx 7: very low frequency, very big batches
+            (1 << 12, 1 << 11, (1 << 12) - 1) // idx 8: ultra low frequency, ultra big batches
         };
 
         // Now I only need to move this slider which points to readonly data.
         // Since int is atomic I can do this without even interlocked.
         // This can be changed without any synchronization.
-        private int _adaptiveIdx = 3;
+        private int _adaptiveIdx = 6;  // Start more conservative for heavy concurrent loads
 
         // Bounded queue parameters
         private const int QueueCapacity = 2048;       // Maximum queue size
-        private const int QueueHighWaterMark = 1536;  // 75% - start reducing index frequency
-        private const int QueueLowWaterMark = 512;    // 25% - start increasing index frequency
+        private const int QueueHighWaterMark = 1024;  // 50% - start reducing index frequency
+        private const int QueueLowWaterMark = 512;    // 25% - start increasing index frequency (raised to prevent oscillation)
 
         // Number of FasterLog shards – must be a power of 2.
         private const int ShardCount = 1 << 2;
@@ -76,14 +76,11 @@ namespace WebServer.Storage
         private readonly ILogger<StreamDB<TDeviceId, T>>? _logger;
         private readonly Task _bgFlushRunner;
         private readonly ManualResetEventSlim _flushSignal = new(false);
-        private readonly ManualResetEventSlim _flushWorkerIdle = new(true); // Set when idle, reset when active
         private readonly Lock _maintenanceLock = new(); // Ensures only one maintenance operation at a time
-
-        // 0 = enabled, 1 = disabled; use Interlocked for memory barriers. This let's me write non-blocking synchronization between the flush worker and the checkpointing logic to ensure we never write to SQLite during a checkpoint.
-        private int _indexWritesDisabled = 0; 
+        private readonly ReaderWriterLockSlim _indexWriteLock = new(LockRecursionPolicy.NoRecursion);
 
         // Interlocked counter for pending index inserts. This is cheaper than calling _pendingIndexInserts.Count which is O(n) on ConcurrentQueue.
-        private int _pendingIndexCount = 0; 
+        private int _pendingIndexCount = 0;
 
         private bool _disposed;
 
@@ -91,6 +88,10 @@ namespace WebServer.Storage
         private long _scaleUpCount = 0;    // Number of times we scaled up (reduced indexing frequency)
         private long _scaleDownCount = 0;  // Number of times we scaled down (increased indexing frequency)
         private long _droppedIndexEntries = 0; // Number of index entries dropped due to queue full
+
+        // Hysteresis: prevent rapid oscillation by requiring multiple batches before adjusting
+        private int _batchesSinceLastAdjustment = 0;
+        private const int MinBatchesBetweenAdjustments = 5;
 
         #endregion
 
@@ -152,7 +153,7 @@ namespace WebServer.Storage
                 _checkpointInterval,
                 _checkpointInterval);
 
-            _bgFlushRunner = Task.Factory.StartNew(FlushWorker, TaskCreationOptions.LongRunning);
+            _bgFlushRunner = Task.Run(FlushWorker);
         }
 
         /// <summary>
@@ -205,41 +206,72 @@ namespace WebServer.Storage
         /// </summary>
         private void FlushWorker()
         {
+            // long lived allocations in the worker to avoid repeated allocations in the hot path
+            var batch = new List<(int DeviceId, long Timestamp, long Address)>(capacity: AdaptiveTuning[^1].batchSize);
+            var referencedShards = new HashSet<int>(capacity: ShardCount);
+            var maxAddrPerShard = new long[ShardCount];
+
             while (!_disposed)
             {
-                // Signal that we're idle before waiting
-                _flushWorkerIdle.Set();
-
-                // Wait for signal or timeout (5 seconds) to check for pending work.
-                // During checkpointing even if this timesout and proceeds the indexWritesDisabled CAS
-                // protects any sqlite transactions from starting till checkpointing completes and resets
-                // the _indexWritesDisabled
+                // Wait for signal or timeout (5 seconds) to check for pending work
                 _flushSignal.Wait(TimeSpan.FromSeconds(5));
                 _flushSignal.Reset();
 
                 if (_disposed)
                     break;
 
-                // Signal that we're now active (processing)
-                _flushWorkerIdle.Reset();
-
-                try
+                // Process all pending batches until queue is empty
+                while (!_pendingIndexInserts.IsEmpty && !_disposed)
                 {
-                    // Process all pending batches until queue is empty
-                    while (!_pendingIndexInserts.IsEmpty && !_disposed)
-                    {
-                        // Check if writes are disabled - use Interlocked.CompareExchange for memory barrier
-                        if (Interlocked.CompareExchange(ref _indexWritesDisabled, 0, 0) != 0)
-                        {
-                            _logger?.LogDebug("FlushWorker: skipping batch during checkpoint window");
-                            break;
-                        }
+                    // Check tuning on every batch for responsiveness (before acquiring lock)
+                    AdaptivelyTuneParameters();
 
-                        // Check tuning on every batch for responsiveness
-                        AdaptivelyTuneParameters();
+                    // Acquire read lock - allows concurrent flushes but blocks during checkpoint (write lock)
+                    // Use blocking lock to ensure queue continues draining even during checkpoints
+                    _indexWriteLock.EnterReadLock();
+                    try
+                    {
+                        // Collect a batch of entries and ensure FasterLog durability before SQLite indexing
+                        batch.Clear();
+                        referencedShards.Clear();
 
                         try
                         {
+                            // Collect a batch of entries to process
+                            int adaptiveIdx = Volatile.Read(ref _adaptiveIdx);
+                            (int _, int batchSize, int _) = AdaptiveTuning[adaptiveIdx];
+
+                            int collected = 0;
+                            while (collected < batchSize && _pendingIndexInserts.TryDequeue(out (int DeviceId, long Timestamp, long Address) entry))
+                            {
+                                // Successfully dequeued - decrement count immediately
+                                Interlocked.Decrement(ref _pendingIndexCount);
+
+                                batch.Add(entry);
+                                var shardIndex = entry.DeviceId & ShardMask;
+                                referencedShards.Add(shardIndex);
+                                if (entry.Address > maxAddrPerShard[shardIndex])
+                                {
+                                    maxAddrPerShard[shardIndex] = entry.Address;
+                                }
+
+                                collected++;
+                            }
+
+                            if (batch.Count == 0)
+                            {
+                                continue;
+                            }
+
+                            // Ensure all referenced shards have committed their entries to disk
+                            // This guarantees that when we write an index entry pointing to address X,
+                            // the data at address X is already durable
+                            foreach (int shardIndex in referencedShards)
+                            {
+                                _shards[shardIndex].CommitAndWait(maxAddrPerShard[shardIndex]);
+                            }
+
+                            // Now write to SQLite - entries are guaranteed to be durable in FasterLog
                             using var pooled = GetConnection();
                             using var tx = pooled.Connection.BeginTransaction();
                             using var cmd = pooled.Connection.CreateCommand();
@@ -250,45 +282,14 @@ namespace WebServer.Storage
                             var pAddr = cmd.Parameters.Add("$addr", SqliteType.Integer);
                             cmd.Prepare();
 
-                            int adaptiveIdx = Volatile.Read(ref _adaptiveIdx);
-                            (int _, int batchSize, int _) = AdaptiveTuning[adaptiveIdx];
-
-                            int flushed = 0;
-                            while (flushed < batchSize && _pendingIndexInserts.TryDequeue(out var entry))
+                            int written = 0;
+                            foreach (var entry in batch)
                             {
-                                // Re-check the flag before each dequeue to avoid processing during checkpoint
-                                // This handles the following race condition:
-                                /*
-                                Worker is at step 2 (blocked, waiting) - _flushWorkerIdle IS SET (shows "idle")
-                                Checkpoint sets _indexWritesDisabled = 1
-                                Checkpoint signals the worker to wake up
-                                Checkpoint calls Wait() on _flushWorkerIdle
-                                    Since the worker is still at step 2, the idle signal is STILL SET
-                                    Wait() returns IMMEDIATELY Checkpoint thinks worker is idle
-                                Worker wakes up from step 2
-                                Worker does step 3 - Reset() the idle signal (NOW shows "active")
-                                Worker enters the try block and starts the while loop
-                                WITHOUT the check, worker would start dequeuing and writing to SQLite DURING THE CHECKPOINT!
-
-                                The fallacy that would lead one to running into this bug is thinking that there is a ping-pong 
-                                like communication between calling Wait and set across threads. No the scheduler does not guarantee
-                                that be careful kids.
-                                */
-                                if (Interlocked.CompareExchange(ref _indexWritesDisabled, 0, 0) != 0)
-                                {
-                                    // Re-enqueue the entry we just dequeued (no count change needed)
-                                    _pendingIndexInserts.Enqueue(entry);
-                                    break;
-                                }
-
-                                // Successfully dequeued and will process - decrement count
-                                Interlocked.Decrement(ref _pendingIndexCount);
-
                                 pDid.Value = entry.DeviceId;
                                 pTs.Value = entry.Timestamp;
                                 pAddr.Value = entry.Address;
                                 cmd.ExecuteNonQuery();
-                                flushed++;
+                                written++;
                             }
 
                             tx.Commit();
@@ -299,12 +300,11 @@ namespace WebServer.Storage
                             // Continue processing despite errors
                         }
                     }
-                }
-                finally
-                {
-                    // Always signal idle when done processing, even if we skipped work
-                    // This ensures checkpoint can proceed
-                    _flushWorkerIdle.Set();
+                    finally
+                    {
+                        // Always release read lock, even on error
+                        _indexWriteLock.ExitReadLock();
+                    }
                 }
             }
         }
@@ -313,23 +313,34 @@ namespace WebServer.Storage
         /// Dynamically adjusts IndexEveryN and FlushBatchSize based on queue depth.
         /// High queue depth (backpressure) → decrease indexing frequency (increase N) and increase batch size
         /// Low queue depth → increase indexing frequency (decrease N) and decrease batch size for lower latency
+        /// Uses hysteresis (batch counter) to prevent rapid oscillation.
         /// </summary>
         private void AdaptivelyTuneParameters()
         {
             int queueDepth = Volatile.Read(ref _pendingIndexCount);
             int currAdaptiveIdx = Volatile.Read(ref _adaptiveIdx);
 
-            // More aggressive scaling: consider medium pressure zone
-            if (queueDepth > (QueueHighWaterMark + QueueLowWaterMark) / 2)
+            // Increment batch counter (hysteresis)
+            int batchesSinceAdj = Interlocked.Increment(ref _batchesSinceLastAdjustment);
+
+            // Only adjust if we've processed enough batches since last adjustment
+            if (batchesSinceAdj < MinBatchesBetweenAdjustments)
             {
-                _adaptiveIdx = Math.Min(currAdaptiveIdx + 1, AdaptiveTuning.Length - 1);
-                _scaleUpCount++;
+                return;
+            }
+
+            if (queueDepth > QueueHighWaterMark)
+            {
+                Volatile.Write(ref _adaptiveIdx, Math.Min(currAdaptiveIdx + 1, AdaptiveTuning.Length - 1));
+                Interlocked.Increment(ref _scaleUpCount);
+                Interlocked.Exchange(ref _batchesSinceLastAdjustment, 0);
             }
             else if (queueDepth < QueueLowWaterMark)
             {
                 // Low backpressure: increase indexing frequency and decrease batch size for lower latency
-                _adaptiveIdx = Math.Max(currAdaptiveIdx - 1, 0);
-                _scaleDownCount++;
+                Volatile.Write(ref _adaptiveIdx, Math.Max(currAdaptiveIdx - 1, 0));
+                Interlocked.Increment(ref _scaleDownCount);
+                Interlocked.Exchange(ref _batchesSinceLastAdjustment, 0);
             }
             // else: normal range, maintain current settings
         }
@@ -354,22 +365,18 @@ namespace WebServer.Storage
             (int indexSpacing, int batchSize, int indexSpacingMask) = AdaptiveTuning[Volatile.Read(ref _adaptiveIdx)];
             bool shouldIndex = (count & indexSpacingMask) == 0;
 
-            // Read _indexWritesDisabled once with memory barrier to ensure consistency
-            bool indexingDisabled = Interlocked.CompareExchange(ref _indexWritesDisabled, 0, 0) != 0;
+            long address = shard.Enqueue(item);
 
-            // During checkpoint window, skip the commit wait to avoid blocking log writes
-            bool waitForCommit = shouldIndex && !indexingDisabled;
-            long address = shard.Enqueue(item, waitForCommit: waitForCommit);
-
-            if (shouldIndex && !indexingDisabled)
+            if (shouldIndex)
             {
                 // Soft-bounded queue: check count for backpressure (eventually consistent)
                 // Race condition is acceptable - queue may briefly exceed capacity before settling
+                // Increment before enqueue to reduce drift window (decrement happens immediately on dequeue)
                 int currentCount = Volatile.Read(ref _pendingIndexCount);
                 if (currentCount < QueueCapacity)
                 {
-                    _pendingIndexInserts.Enqueue((deviceId, timestamp, address));
                     Interlocked.Increment(ref _pendingIndexCount);
+                    _pendingIndexInserts.Enqueue((deviceId, timestamp, address));
                     // in aggressive scenarios as index frequency goes down we want to make sure the worker is signaled to process the larger batches in a timely manner
                     _flushSignal.Set();
                 }
@@ -401,8 +408,8 @@ namespace WebServer.Storage
                 Thread.Sleep(50);
             }
 
-            // Wait for worker to signal idle
-            _flushWorkerIdle.Wait(TimeSpan.FromSeconds(5));
+            // Give worker a bit more time to complete any in-flight batch
+            Thread.Sleep(100);
         }
 
         /// <summary>
@@ -644,31 +651,12 @@ namespace WebServer.Storage
             {
                 _logger?.LogInformation("RunCheckpoint: starting checkpoint window");
 
-                // Disable index writes atomically with memory barrier - new writes won't queue index entries
-                Interlocked.Exchange(ref _indexWritesDisabled, 1);
-
-                // Signal flush worker to wake up and process any pending work
-                _flushSignal.Set();
-
-                // Wait for worker to reach idle state (not actively writing).
-                // If it has reached an IDLE state it will create anymore SQLITE transactions
-                _flushWorkerIdle.Wait();
-
-                // Additional safety: wait for pending queue to be fully drained
-                var sw = Stopwatch.StartNew();
-                while (!_pendingIndexInserts.IsEmpty && sw.Elapsed < TimeSpan.FromSeconds(10))
-                {
-                    Thread.Sleep(10);
-                }
-
-                if (!_pendingIndexInserts.IsEmpty)
-                {
-                    _logger?.LogWarning("RunCheckpoint: proceeding with {Count} pending index entries still queued", Volatile.Read(ref _pendingIndexCount));
-                }
-
+                // Acquire write lock - blocks until all ongoing index writes (read locks) complete
+                // and prevents new index writes from starting
+                _indexWriteLock.EnterWriteLock();
                 try
                 {
-                    sw.Restart();
+                    var sw = Stopwatch.StartNew();
                     using var pooled = GetConnection();
                     using var cmd = pooled.Connection.CreateCommand();
                     // This mode blocks (invokes the busy-handler callback) until there is no database writer and 
@@ -713,8 +701,8 @@ namespace WebServer.Storage
                 }
                 finally
                 {
-                    // Re-enable index writes atomically with memory barrier
-                    Interlocked.Exchange(ref _indexWritesDisabled, 0);
+                    // Release write lock - allows index writes to resume
+                    _indexWriteLock.ExitWriteLock();
 
                     // Signal the flush worker to process any accumulated entries
                     _flushSignal.Set();
@@ -898,7 +886,7 @@ namespace WebServer.Storage
 
             // Dispose synchronization primitives
             _flushSignal.Dispose();
-            _flushWorkerIdle.Dispose();
+            _indexWriteLock.Dispose();
 
             // Dispose shards (commits FasterLog)
             foreach (var shard in _shards)
@@ -935,20 +923,20 @@ namespace WebServer.Storage
                 var settings = new FasterLogSettings
                 {
                     LogDevice = Devices.CreateLogDevice(logPath, deleteOnClose: false),
-                    PageSizeBits = 22,   // 4 MB pages
-                    MemorySizeBits = 24, // 16 MB in-memory
+                    // PageSizeBits = 22,   // 4 MB pages
+                    // MemorySizeBits = 24, // 16 MB in-memory
                     TryRecoverLatest = true,
                     AutoRefreshSafeTailAddress = true,
-                    AutoCommit = true,
+                    // AutoCommit = true,
                     // LogCommitPolicy = LogCommitPolicy.RateLimit(1_000, 1024 * 1024 * 1024) // 1 mb/s or 1 second, whichever comes first
                 };
                 _log = new FasterLog(settings);
             }
 
-            public long Enqueue(in T item, bool waitForCommit)
+            public long Enqueue(in T item)
             {
                 ReadOnlySpan<byte> payload = MemoryMarshal.AsBytes(new ReadOnlySpan<T>(in item));
-                return waitForCommit ? _log.EnqueueAndWaitForCommit(payload) : _log.Enqueue(payload);
+                return _log.Enqueue(payload);
             }
 
             /// <summary>
@@ -1118,6 +1106,17 @@ namespace WebServer.Storage
             }
 
             /// <summary>
+            /// Commit all pending writes to disk and wait until the specified address is durable.
+            /// This ensures durability before creating index entries that reference these log addresses.
+            /// </summary>
+            public void CommitAndWait(long untilAddress)
+            {
+                _log.Commit(spinWait: true);
+                // Synchronously wait for commit up to the specified address
+                _log.WaitForCommitAsync(untilAddress).AsTask().GetAwaiter().GetResult();
+            }
+
+            /// <summary>
             /// Truncate the log up to the given address, freeing disk space for old entries.
             /// </summary>
             public void TruncateUntil(long untilAddress) => _log.TruncateUntil(untilAddress);
@@ -1127,6 +1126,7 @@ namespace WebServer.Storage
                 _log.Commit(true);
                 _log.Dispose();
             }
+
         }
 
     }
