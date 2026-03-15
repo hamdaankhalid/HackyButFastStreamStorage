@@ -132,7 +132,7 @@ Console.WriteLine($"Queue Depth: {stats.PendingIdxQueueLen}");
 ## Write Path Details
 
 ### 1. Append to FasterLog
-- **In-memory operation**: ~50-100μs
+- **In-memory operation**: No fsync, in hotpath.
 - **Lock-free**: Multiple threads can append concurrently
 - **Per-shard**: Reduces contention
 
