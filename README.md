@@ -6,7 +6,7 @@ Time-series storage for device telemetry with sparse indexing and adaptive batch
 
 StreamDB is a specialized storage engine designed for high-throughput device telemetry ingestion with efficient time-range queries. It combines FasterLog's append-only log with SQLite sparse indexing to achieve:
 
-- **Non-blocking writes**: <100μs latency, never waits for index updates
+- **Non-blocking writes**: Never waits for index updates
 - **Efficient range queries**: O(log N) index lookup + bounded scan
 - **Automatic retention**: Configurable data lifecycle management
 - **Adaptive indexing**: Self-tunes based on write pressure
