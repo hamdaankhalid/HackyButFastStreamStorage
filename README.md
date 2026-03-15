@@ -1,6 +1,6 @@
 # StreamDB
 
-High-performance sharded time-series storage for device telemetry with sparse indexing and adaptive batching.
+Time-series storage for device telemetry with sparse indexing and adaptive batching.
 
 ## Overview
 
