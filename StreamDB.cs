@@ -153,7 +153,7 @@ namespace WebServer.Storage
                 _checkpointInterval,
                 _checkpointInterval);
 
-            _bgFlushRunner = Task.Run(FlushWorker);
+            _bgFlushRunner = Task.Factory.StartNew(FlushWorker, TaskCreationOptions.LongRunning);
         }
 
         /// <summary>
@@ -268,7 +268,12 @@ namespace WebServer.Storage
                             // the data at address X is already durable
                             foreach (int shardIndex in referencedShards)
                             {
-                                _shards[shardIndex].CommitAndWait(maxAddrPerShard[shardIndex]);
+                                // Sync-over-async is okay here because the worker thread can block without impacting the main write path.
+                                _shards[shardIndex]
+                                    .CommitAndWait(maxAddrPerShard[shardIndex])
+                                    .AsTask()
+                                    .GetAwaiter()
+                                    .GetResult();
                             }
 
                             // Now write to SQLite - entries are guaranteed to be durable in FasterLog
@@ -1109,11 +1114,10 @@ namespace WebServer.Storage
             /// Commit all pending writes to disk and wait until the specified address is durable.
             /// This ensures durability before creating index entries that reference these log addresses.
             /// </summary>
-            public void CommitAndWait(long untilAddress)
+            public ValueTask CommitAndWait(long untilAddress)
             {
-                _log.Commit(spinWait: true);
-                // Synchronously wait for commit up to the specified address
-                _log.WaitForCommitAsync(untilAddress).AsTask().GetAwaiter().GetResult();
+                _log.Commit(spinWait: false);
+                return _log.WaitForCommitAsync(untilAddress);
             }
 
             /// <summary>
