@@ -40,6 +40,7 @@ public class WriteBenchmarks
     private StreamDB.StreamDB _streamDb = null!;
     private SqliteConnection _sqliteConn = null!;
     private RocksDb _rocksDb = null!;
+    private WriteOptions _syncWriteOptions = null!;
 
     private byte[] _payloadBytes = null!;
 
@@ -70,7 +71,7 @@ public class WriteBenchmarks
         _sqliteConn = new SqliteConnection($"Data Source={sqlitePath}");
         _sqliteConn.Open();
         using var pragma = _sqliteConn.CreateCommand();
-        pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;";
+        pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;";
         pragma.ExecuteNonQuery();
         using var create = _sqliteConn.CreateCommand();
         create.CommandText = """
@@ -88,6 +89,7 @@ public class WriteBenchmarks
         _rocksDir = Path.Combine(baseTmp, $"rocks-{Guid.NewGuid():N}");
         var options = new DbOptions().SetCreateIfMissing(true);
         _rocksDb = RocksDb.Open(options, _rocksDir);
+        _syncWriteOptions = new WriteOptions().SetSync(true);
     }
 
     [IterationCleanup]
@@ -155,7 +157,7 @@ public class WriteBenchmarks
             MemoryMarshal.Write(keyBuffer[4..], in primaryIndex);
             batch.Put(keyBuffer.ToArray(), _payloadBytes);
         }
-        _rocksDb.Write(batch);
+        _rocksDb.Write(batch, _syncWriteOptions);
     }
 
     private static void TryDelete(string? path)
@@ -207,7 +209,7 @@ public class ReadBenchmarks
         _sqliteConn.Open();
         using (var pragma = _sqliteConn.CreateCommand())
         {
-            pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;";
+            pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;";
             pragma.ExecuteNonQuery();
         }
         using (var create = _sqliteConn.CreateCommand())
