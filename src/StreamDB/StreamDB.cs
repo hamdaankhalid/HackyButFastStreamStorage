@@ -977,7 +977,9 @@ namespace StreamDB
 
                 long cutoffPi = DateTimeOffset.UtcNow.ToUnixTimeSeconds() - (long)_retentionPeriod.TotalSeconds;
                 PurgeIndexBefore(cutoffPi);
-                _lateArrivals.PurgeBefore(cutoffPi);
+                long remainingLateArrivals = _lateArrivals.PurgeBefore(cutoffPi);
+                if (remainingLateArrivals == 0)
+                    Volatile.Write(ref _lateArrivalCount, 0);
                 TruncateShards(cutoffPi);
 
                 _logger?.LogInformation("RunRetention: retention complete");

@@ -207,14 +207,19 @@ namespace StreamDB
         /// <summary>
         /// Delete late arrivals older than <paramref name="cutoffPi"/>.
         /// Called during retention to keep the side store bounded.
+        /// Returns the number of rows remaining after the purge.
         /// </summary>
-        public void PurgeBefore(long cutoffPi)
+        public long PurgeBefore(long cutoffPi)
         {
             using PooledConnection pooled = _getConnection();
-            using SqliteCommand cmd = pooled.Connection.CreateCommand();
-            cmd.CommandText = "DELETE FROM late_arrivals WHERE primary_index < $cutoff";
-            cmd.Parameters.AddWithValue("$cutoff", cutoffPi);
-            cmd.ExecuteNonQuery();
+            using SqliteCommand del = pooled.Connection.CreateCommand();
+            del.CommandText = "DELETE FROM late_arrivals WHERE primary_index < $cutoff";
+            del.Parameters.AddWithValue("$cutoff", cutoffPi);
+            del.ExecuteNonQuery();
+
+            using SqliteCommand cnt = pooled.Connection.CreateCommand();
+            cnt.CommandText = "SELECT COUNT(*) FROM late_arrivals";
+            return (long)cnt.ExecuteScalar()!;
         }
 
         private static List<StreamEntry> ReadEntries(SqliteCommand cmd)
