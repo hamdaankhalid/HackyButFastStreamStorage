@@ -69,7 +69,7 @@ Each record stored in FasterLog has a 16-byte header followed by a variable-leng
 - **Primary Index**: Used for range queries and ordering (e.g. timestamp, sequence number)
 - **Secondary Index**: Used for sharding and filtering (e.g., device ID, sensor ID, user ID)
 - **Version**: Schema version for payload format evolution
-- **Payload**: Opaque bytes — StreamDB never interprets these
+- **Payload**: Opaque bytes — StreamDB never interprets these; **max 65,535 bytes (≈64 KB)** since the length is stored as a `ushort`
 
 ## Usage
 

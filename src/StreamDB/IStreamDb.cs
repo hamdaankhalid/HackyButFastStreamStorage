@@ -26,6 +26,7 @@ namespace StreamDB
         /// schema version, and raw payload bytes. Late-arriving entries (out-of-order
         /// primary indexes) are handled transparently.
         /// </summary>
+        /// <remarks>Maximum payload size is 65,535 bytes (≈64 KB) — the length is stored as a <c>ushort</c> in the record header.</remarks>
         void Append(long primaryIndex, int secondaryIndex, ushort version, ReadOnlySpan<byte> payload);
 
         /// <summary>

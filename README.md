@@ -20,6 +20,7 @@ The primary index determines **when** (or **where in sequence**) something happe
 ### Key Properties
 
 - **Non-blocking writes** — appends go to an in-memory FasterLog buffer; no fsync in the hot path
+- **Max payload size: 65,535 bytes (≈64 KB)** — payload length is stored as a `ushort` in the record header
 - **Adaptive sparse indexing** — automatically tunes index density based on write pressure (16x–4096x)
 - **Schema-on-read** — records carry a version tag; callers deserialize at read time
 - **Sharded storage** — distributes data across multiple FasterLog instances to reduce contention

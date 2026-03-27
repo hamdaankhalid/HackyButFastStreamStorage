@@ -46,6 +46,9 @@ namespace StreamDB
         /// </summary>
         public long Enqueue(int secondaryIndex, ReadOnlySpan<byte> payload, long primaryIndex, ushort version)
         {
+            if (payload.Length > ushort.MaxValue)
+                throw new ArgumentException($"Payload size {payload.Length} exceeds the maximum of {ushort.MaxValue} bytes (≈64 KB).", nameof(payload));
+
             int totalSize = StreamHeader.Size + payload.Length;
             Span<byte> buffer = totalSize <= 256
                 ? stackalloc byte[totalSize]
