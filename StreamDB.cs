@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -8,23 +8,27 @@ using Microsoft.Data.Sqlite;
 namespace WebServer.Storage
 {
     /// <summary>
-    /// StreamDBManager shards device writes across a fixed pool of FasterLog instances
-    /// and uses a shared SQLite database for sparse timestamp→address index lookups.
+    /// Schema-on-read stream storage engine. Shards writes across a fixed pool of FasterLog
+    /// instances and uses a shared SQLite database for sparse timestamp→address index lookups.
     ///
-    /// Each device is deterministically assigned to a shard via <c>deviceId &amp; ShardMask</c>.
-    /// Multiple devices share the same log, reducing file handle and resource overhead.
+    /// Records are stored with a 16-byte header:
+    /// [8B timestamp (primary index)] [4B secondary index] [2B version] [2B payload length] [payload bytes]
     ///
-    /// Write path: Append struct bytes to the device's shard, every Nth write per device insert (timestamp, address) into SQLite.
-    /// Read path:  Query SQLite for the closest address ≤ startTs, scan the shard filtering by deviceId.
+    /// The secondary index is used for sharding (<c>secondaryIndex &amp; ShardMask</c>) and scan filtering.
+    /// For telemetry data the secondary index stores the device ID.
+    ///
+    /// Write path: Append header + payload bytes to the shard, every Nth write insert (timestamp, address) into SQLite.
+    /// Read path:  Query SQLite for the closest address ≤ startTs, scan the shard filtering by secondary index.
     ///
     /// Retention: A background timer periodically removes index entries older than the retention
     /// period and truncates each FasterLog shard up to the minimum surviving address.
     /// </summary>
-    /// <typeparam name="TDeviceId">The type of the device ID field stored at offset 0 in telemetry structs (ushort or uint).</typeparam>
-    /// <typeparam name="T">The type of telemetry struct stored in this StreamDB instance.</typeparam>
-    public sealed class StreamDB<TDeviceId, T> : IDisposable where TDeviceId : unmanaged where T : unmanaged
+    public sealed class StreamDB : IDisposable
     {
         #region member variables and Consts
+
+        private const string StreamIndexDbName = "stream_index.db";
+        private const string ShardLogFmt = "shard_{0}.log";
 
         // Adaptive indexing parameters - dynamically adjusted based on queue backpressure
 
@@ -73,7 +77,7 @@ namespace WebServer.Storage
         private readonly Timer _retentionTimer;
         private readonly Timer _checkpointTimer;
         private readonly TimeSpan _checkpointInterval;
-        private readonly ILogger<StreamDB<TDeviceId, T>>? _logger;
+        private readonly ILogger<StreamDB>? _logger;
         private readonly Task _bgFlushRunner;
         private readonly ManualResetEventSlim _flushSignal = new(false);
         private readonly Lock _maintenanceLock = new(); // Ensures only one maintenance operation at a time
@@ -95,7 +99,7 @@ namespace WebServer.Storage
 
         #endregion
 
-        public StreamDB(string? baseDir = null, TimeSpan? retentionPeriod = null, TimeSpan? checkpointInterval = null, ILogger<StreamDB<TDeviceId, T>>? logger = null)
+        public StreamDB(string? baseDir = null, TimeSpan? retentionPeriod = null, TimeSpan? checkpointInterval = null, ILogger<StreamDB>? logger = null)
         {
             _logger = logger;
             _baseDir = baseDir ?? "streams";
@@ -104,15 +108,15 @@ namespace WebServer.Storage
             _retentionPeriod = retentionPeriod ?? TimeSpan.FromDays(60);
             _checkpointInterval = checkpointInterval ?? TimeSpan.FromHours(1);
 
-            string dbPath = Path.Combine(_baseDir, Constants.StreamIndexDbName);
+            string dbPath = Path.Combine(_baseDir, StreamIndexDbName);
             _connectionString = new SqliteConnectionStringBuilder
             {
                 DataSource = dbPath,
                 Pooling = false // We manage our own pool
             }.ToString();
 
-            using var init = GetConnection();
-            using var cmd = init.Connection.CreateCommand();
+            using PooledConnection init = GetConnection();
+            using SqliteCommand cmd = init.Connection.CreateCommand();
             cmd.CommandText =
                 """
                 CREATE TABLE IF NOT EXISTS stream_index (
@@ -165,9 +169,9 @@ namespace WebServer.Storage
         /// </summary>
         private void RecoverIndex()
         {
-            using var pooled = GetConnection();
-            using var tx = pooled.Connection.BeginTransaction();
-            using var cmd = pooled.Connection.CreateCommand();
+            using PooledConnection pooled = GetConnection();
+            using SqliteTransaction tx = pooled.Connection.BeginTransaction();
+            using SqliteCommand cmd = pooled.Connection.CreateCommand();
             cmd.Transaction = tx;
             cmd.CommandText =
                 """
@@ -175,10 +179,10 @@ namespace WebServer.Storage
                 WHERE (device_id & $mask) = $shard
                   AND (log_address < $begin OR log_address >= $tail)
                 """;
-            var pMask = cmd.Parameters.Add("$mask", SqliteType.Integer);
-            var pShard = cmd.Parameters.Add("$shard", SqliteType.Integer);
-            var pBegin = cmd.Parameters.Add("$begin", SqliteType.Integer);
-            var pTail = cmd.Parameters.Add("$tail", SqliteType.Integer);
+            SqliteParameter pMask = cmd.Parameters.Add("$mask", SqliteType.Integer);
+            SqliteParameter pShard = cmd.Parameters.Add("$shard", SqliteType.Integer);
+            SqliteParameter pBegin = cmd.Parameters.Add("$begin", SqliteType.Integer);
+            SqliteParameter pTail = cmd.Parameters.Add("$tail", SqliteType.Integer);
             cmd.Prepare();
 
             pMask.Value = ShardMask;
@@ -207,8 +211,8 @@ namespace WebServer.Storage
         private void FlushWorker()
         {
             // long lived allocations in the worker to avoid repeated allocations in the hot path
-            var batch = new List<(int DeviceId, long Timestamp, long Address)>(capacity: AdaptiveTuning[^1].batchSize);
-            var referencedShards = new HashSet<int>(capacity: ShardCount);
+            List<(int DeviceId, long Timestamp, long Address)> batch = new List<(int DeviceId, long Timestamp, long Address)>(capacity: AdaptiveTuning[^1].batchSize);
+            HashSet<int> referencedShards = new HashSet<int>(capacity: ShardCount);
             var maxAddrPerShard = new long[ShardCount];
 
             while (!_disposed)
@@ -277,18 +281,18 @@ namespace WebServer.Storage
                             }
 
                             // Now write to SQLite - entries are guaranteed to be durable in FasterLog
-                            using var pooled = GetConnection();
-                            using var tx = pooled.Connection.BeginTransaction();
-                            using var cmd = pooled.Connection.CreateCommand();
+                            using PooledConnection pooled = GetConnection();
+                            using SqliteTransaction tx = pooled.Connection.BeginTransaction();
+                            using SqliteCommand cmd = pooled.Connection.CreateCommand();
                             cmd.Transaction = tx;
                             cmd.CommandText = "INSERT INTO stream_index (device_id, timestamp, log_address) VALUES ($did, $ts, $addr)";
-                            var pDid = cmd.Parameters.Add("$did", SqliteType.Integer);
-                            var pTs = cmd.Parameters.Add("$ts", SqliteType.Integer);
-                            var pAddr = cmd.Parameters.Add("$addr", SqliteType.Integer);
+                            SqliteParameter pDid = cmd.Parameters.Add("$did", SqliteType.Integer);
+                            SqliteParameter pTs = cmd.Parameters.Add("$ts", SqliteType.Integer);
+                            SqliteParameter pAddr = cmd.Parameters.Add("$addr", SqliteType.Integer);
                             cmd.Prepare();
 
                             int written = 0;
-                            foreach (var entry in batch)
+                            foreach ((int DeviceId, long Timestamp, long Address) entry in batch)
                             {
                                 pDid.Value = entry.DeviceId;
                                 pTs.Value = entry.Timestamp;
@@ -350,27 +354,23 @@ namespace WebServer.Storage
             // else: normal range, maintain current settings
         }
 
-        /*
-        The invariant this needs to maintain is that writes are arranged monotonically by timestamp on the FasterLog.
-        This is guaranteed by the fact that each the upstream processor serializes these calls per device.
-        That means the timestamp is always monotonically increasing for each device, so we can safely index every Nth write without worrying about out-of-order timestamps.
-        While multiple devices may be out of order, each device's timeline is strictly ordered, 
-        so readers can safely scan forward from the nearest indexed timestamp and stop when they pass the endTs without missing any relevant entries.
-        Any group/multiple device id will first have to find the minimum address to start from and then scan forward, so as long as the index entries are not too sparse, 
-        the scan distance is bounded and performance is good.
-        */
-        public void Append(int deviceId, in T item, long timestamp)
+        /// <summary>
+        /// Append a record to the stream. The record is stored with a 16-byte header
+        /// followed by the raw payload bytes. The secondary index is used for shard selection
+        /// and sparse indexing; the timestamp is the primary index for range queries.
+        /// </summary>
+        public void Append(int secondaryIndex, ReadOnlySpan<byte> payload, long timestamp, ushort version)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
 
-            LogShard shard = GetShard(deviceId);
-            int count = _writeCounts.AddOrUpdate(deviceId, 1, static (_, prev) => prev + 1);
+            LogShard shard = GetShard(secondaryIndex);
+            int count = _writeCounts.AddOrUpdate(secondaryIndex, 1, static (_, prev) => prev + 1);
 
             // Use adaptive indexing frequency
             (int indexSpacing, int batchSize, int indexSpacingMask) = AdaptiveTuning[Volatile.Read(ref _adaptiveIdx)];
             bool shouldIndex = (count & indexSpacingMask) == 0;
 
-            long address = shard.Enqueue(item);
+            long address = shard.Enqueue(secondaryIndex, payload, timestamp, version);
 
             if (shouldIndex)
             {
@@ -381,7 +381,7 @@ namespace WebServer.Storage
                 if (currentCount < QueueCapacity)
                 {
                     Interlocked.Increment(ref _pendingIndexCount);
-                    _pendingIndexInserts.Enqueue((deviceId, timestamp, address));
+                    _pendingIndexInserts.Enqueue((secondaryIndex, timestamp, address));
                     // in aggressive scenarios as index frequency goes down we want to make sure the worker is signaled to process the larger batches in a timely manner
                     _flushSignal.Set();
                 }
@@ -389,7 +389,6 @@ namespace WebServer.Storage
                 {
                     // Queue is full - drop this index entry
                     // This is acceptable because we have sparse indexing and can always scan from a previous entry.
-                    // This is however not desired because it fucks up the time complexity of making queries
                     Interlocked.Increment(ref _droppedIndexEntries);
                 }
             }
@@ -407,7 +406,7 @@ namespace WebServer.Storage
             _flushSignal.Set();
 
             // Wait for worker to process all entries
-            var sw = Stopwatch.StartNew();
+            Stopwatch sw = Stopwatch.StartNew();
             while (!_pendingIndexInserts.IsEmpty && sw.Elapsed < TimeSpan.FromSeconds(10))
             {
                 Thread.Sleep(50);
@@ -432,22 +431,22 @@ namespace WebServer.Storage
 
         #region Read Methods
 
-        public List<T> ReadRange(int deviceId, long startTs, long endTs, Func<T, long> getTimestamp, int limit = 0)
+        public List<StreamEntry> ReadRange(int secondaryIndex, long startTs, long endTs, int limit = 0)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
 
-            _logger?.LogDebug("ReadRange: deviceId={DeviceId}, startTs={StartTs}, endTs={EndTs}, limit={Limit}",
-                deviceId, startTs, endTs, limit);
+            _logger?.LogDebug("ReadRange: secondaryIndex={SecondaryIndex}, startTs={StartTs}, endTs={EndTs}, limit={Limit}",
+                secondaryIndex, startTs, endTs, limit);
 
-            long scanFrom = LookupNearestAddress(deviceId, startTs);
-            _logger?.LogDebug("ReadRange: deviceId={DeviceId} -> scanFrom={ScanFrom} (shard={Shard})",
-                deviceId, scanFrom, deviceId & ShardMask);
+            long scanFrom = LookupNearestAddress(secondaryIndex, startTs);
+            _logger?.LogDebug("ReadRange: secondaryIndex={SecondaryIndex} -> scanFrom={ScanFrom} (shard={Shard})",
+                secondaryIndex, scanFrom, secondaryIndex & ShardMask);
 
-            LogShard shard = GetShard(deviceId);
-            var results = shard.ScanRange(deviceId, scanFrom, startTs, endTs, getTimestamp, limit);
+            LogShard shard = GetShard(secondaryIndex);
+            List<StreamEntry> results = shard.ScanRange(secondaryIndex, scanFrom, startTs, endTs, limit);
 
-            _logger?.LogDebug("ReadRange: deviceId={DeviceId} -> returned {Count} items",
-                deviceId, results.Count);
+            _logger?.LogDebug("ReadRange: secondaryIndex={SecondaryIndex} -> returned {Count} items",
+                secondaryIndex, results.Count);
 
             return results;
         }
@@ -455,84 +454,72 @@ namespace WebServer.Storage
         /// <summary>
         /// Multi-device overload of ReadRange. Groups devices by shard to minimize redundant scanning.
         /// For each shard, looks up the nearest address ≤ startTs across all devices in that shard, 
-        /// then scans once per shard to collect results for all devices. Returns a dictionary keyed by deviceId.
+        /// then scans once per shard to collect results for all devices. Returns a dictionary keyed by secondary index.
         /// </summary>
-        /// <param name="deviceIds">Collection of device IDs to query.</param>
-        /// <param name="startTs">Start timestamp (inclusive) in Unix seconds.</param>
-        /// <param name="endTs">End timestamp (inclusive) in Unix seconds.</param>
-        /// <param name="getTimestamp">Function to extract the timestamp from a deserialized item.</param>
-        /// <param name="limit">Maximum number of items to return per device. 0 means unlimited.</param>
-        /// <returns>Dictionary mapping device IDs to their respective lists of items within the time range.</returns>
-        public Dictionary<int, List<T>> ReadRange(IEnumerable<int> deviceIds, long startTs, long endTs, Func<T, long> getTimestamp, int limit = 0)
+        public Dictionary<int, List<StreamEntry>> ReadRange(IEnumerable<int> secondaryIndexes, long startTs, long endTs, int limit = 0)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
 
-            var deviceIdList = deviceIds.ToList();
-            _logger?.LogDebug("ReadRange (multi-device): deviceIds=[{DeviceIds}], startTs={StartTs}, endTs={EndTs}, limit={Limit}",
-                string.Join(", ", deviceIdList), startTs, endTs, limit);
+            List<int> indexList = secondaryIndexes.ToList();
+            _logger?.LogDebug("ReadRange (multi-device): secondaryIndexes=[{Indexes}], startTs={StartTs}, endTs={EndTs}, limit={Limit}",
+                string.Join(", ", indexList), startTs, endTs, limit);
 
             // Group devices by shard so we can scan each shard at most once.
-            var shardGroups = new Dictionary<int, (HashSet<int> Devices, long MinAddress)>();
+            Dictionary<int, (HashSet<int> Indexes, long MinAddress)> shardGroups = new Dictionary<int, (HashSet<int> Indexes, long MinAddress)>();
 
-            foreach (int deviceId in deviceIdList)
+            foreach (int idx in indexList)
             {
-                int shardIndex = deviceId & ShardMask;
-                long addr = LookupNearestAddress(deviceId, startTs);
+                int shardIndex = idx & ShardMask;
+                long addr = LookupNearestAddress(idx, startTs);
 
-                if (shardGroups.TryGetValue(shardIndex, out var group))
+                if (shardGroups.TryGetValue(shardIndex, out (HashSet<int> Indexes, long MinAddress) group))
                 {
-                    group.Devices.Add(deviceId);
+                    group.Indexes.Add(idx);
                     if (addr < group.MinAddress)
-                        shardGroups[shardIndex] = (group.Devices, addr);
+                        shardGroups[shardIndex] = (group.Indexes, addr);
                 }
                 else
                 {
-                    shardGroups[shardIndex] = (new HashSet<int> { deviceId }, addr);
+                    shardGroups[shardIndex] = (new HashSet<int> { idx }, addr);
                 }
             }
 
-            var result = new Dictionary<int, List<T>>();
+            Dictionary<int, List<StreamEntry>> result = new Dictionary<int, List<StreamEntry>>();
 
             _logger?.LogDebug("ReadRange (multi-device): grouped into {ShardCount} shards", shardGroups.Count);
 
-            foreach (var (shardIndex, (devices, minAddress)) in shardGroups)
+            foreach ((int shardIndex, (HashSet<int>? indexes, long minAddress)) in shardGroups)
             {
-                _logger?.LogDebug("ReadRange (multi-device): scanning shard {ShardIndex} with {DeviceCount} devices from address {MinAddress}",
-                    shardIndex, devices.Count, minAddress);
+                _logger?.LogDebug("ReadRange (multi-device): scanning shard {ShardIndex} with {Count} indexes from address {MinAddress}",
+                    shardIndex, indexes.Count, minAddress);
 
-                var shardResults = _shards[shardIndex].ScanRange(devices, minAddress, startTs, endTs, getTimestamp, limit);
+                Dictionary<int, List<StreamEntry>> shardResults = _shards[shardIndex].ScanRange(indexes, minAddress, startTs, endTs, limit);
 
-                foreach (var (deviceId, items) in shardResults)
+                foreach ((int idx, List<StreamEntry>? items) in shardResults)
                 {
-                    result[deviceId] = items;
+                    result[idx] = items;
                 }
             }
 
             var totalItems = result.Values.Sum(list => list.Count);
-            _logger?.LogDebug("ReadRange (multi-device): returned {TotalItems} items across {DeviceCount} devices",
+            _logger?.LogDebug("ReadRange (multi-device): returned {TotalItems} items across {Count} indexes",
                 totalItems, result.Count);
 
             return result;
         }
 
         /// <summary>
-        /// All-devices overload of ReadRange. Scans all shards and returns data for every device
-        /// that has data in the specified time range. More efficient than querying individual devices
-        /// when you need a complete timeline across the entire system.
+        /// All-devices overload of ReadRange. Scans all shards and returns data for every secondary index
+        /// that has data in the specified time range.
         /// </summary>
-        /// <param name="startTs">Start timestamp (inclusive) in Unix seconds.</param>
-        /// <param name="endTs">End timestamp (inclusive) in Unix seconds.</param>
-        /// <param name="getTimestamp">Function to extract the timestamp from a deserialized item.</param>
-        /// <param name="limit">Maximum number of items to return per device. 0 means unlimited.</param>
-        /// <returns>Dictionary mapping device IDs to their respective lists of items within the time range.</returns>
-        public Dictionary<int, List<T>> ReadRange(long startTs, long endTs, Func<T, long> getTimestamp, int limit = 0)
+        public Dictionary<int, List<StreamEntry>> ReadRange(long startTs, long endTs, int limit = 0)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
 
             _logger?.LogDebug("ReadRange (all-devices): startTs={StartTs}, endTs={EndTs}, limit={Limit}",
                 startTs, endTs, limit);
 
-            var result = new Dictionary<int, List<T>>();
+            Dictionary<int, List<StreamEntry>> result = new Dictionary<int, List<StreamEntry>>();
 
             // Scan all shards
             for (int shardIndex = 0; shardIndex < ShardCount; shardIndex++)
@@ -542,51 +529,49 @@ namespace WebServer.Storage
                 _logger?.LogDebug("ReadRange (all-devices): scanning shard {ShardIndex} from address {Address}",
                     shardIndex, addr);
 
-                var shardResults = _shards[shardIndex].ScanRangeAllDevices(addr, startTs, endTs, getTimestamp, limit);
+                Dictionary<int, List<StreamEntry>> shardResults = _shards[shardIndex].ScanRangeAllDevices(addr, startTs, endTs, limit);
 
-                foreach (var (deviceId, items) in shardResults)
+                foreach ((int idx, List<StreamEntry>? items) in shardResults)
                 {
-                    result[deviceId] = items;
+                    result[idx] = items;
                 }
             }
 
             var totalItems = result.Values.Sum(list => list.Count);
-            _logger?.LogDebug("ReadRange (all-devices): returned {TotalItems} items across {DeviceCount} devices",
+            _logger?.LogDebug("ReadRange (all-devices): returned {TotalItems} items across {Count} indexes",
                 totalItems, result.Count);
 
             return result;
         }
 
         /// <summary>
-        /// Returns the minimum earliest timestamp across all requested devices by scanning
-        /// the FasterLog from the sparse index pointer. For each shard, looks up the nearest
-        /// address and scans forward until it finds the first entry ≥ <paramref name="fromTs"/>
-        /// for any of the requested devices. Returns null if no data exists.
+        /// Returns the minimum earliest timestamp across all requested secondary indexes by scanning
+        /// the FasterLog from the sparse index pointer. Returns null if no data exists.
         /// </summary>
-        public long? GetEarliestTimestamp(IEnumerable<int> deviceIds, long fromTs, Func<T, long> getTimestamp)
+        public long? GetEarliestTimestamp(IEnumerable<int> secondaryIndexes, long fromTs)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
 
-            var deviceIdList = deviceIds.ToList();
-            _logger?.LogDebug("GetEarliestTimestamp: deviceIds=[{DeviceIds}], fromTs={FromTs}",
-                string.Join(", ", deviceIdList), fromTs);
+            List<int> indexList = secondaryIndexes.ToList();
+            _logger?.LogDebug("GetEarliestTimestamp: secondaryIndexes=[{Indexes}], fromTs={FromTs}",
+                string.Join(", ", indexList), fromTs);
 
-            var shardGroups = new Dictionary<int, (HashSet<int> Devices, long MinAddress)>();
+            Dictionary<int, (HashSet<int> Indexes, long MinAddress)> shardGroups = new Dictionary<int, (HashSet<int> Indexes, long MinAddress)>();
 
-            foreach (int deviceId in deviceIdList)
+            foreach (int idx in indexList)
             {
-                int shardIndex = deviceId & ShardMask;
-                long addr = LookupNearestAddress(deviceId, fromTs);
+                int shardIndex = idx & ShardMask;
+                long addr = LookupNearestAddress(idx, fromTs);
 
-                if (shardGroups.TryGetValue(shardIndex, out var group))
+                if (shardGroups.TryGetValue(shardIndex, out (HashSet<int> Indexes, long MinAddress) group))
                 {
-                    group.Devices.Add(deviceId);
+                    group.Indexes.Add(idx);
                     if (addr < group.MinAddress)
-                        shardGroups[shardIndex] = (group.Devices, addr);
+                        shardGroups[shardIndex] = (group.Indexes, addr);
                 }
                 else
                 {
-                    shardGroups[shardIndex] = (new HashSet<int> { deviceId }, addr);
+                    shardGroups[shardIndex] = (new HashSet<int> { idx }, addr);
                 }
             }
 
@@ -594,12 +579,12 @@ namespace WebServer.Storage
 
             _logger?.LogDebug("GetEarliestTimestamp: grouped into {ShardCount} shards", shardGroups.Count);
 
-            foreach (var (shardIndex, (devices, minAddress)) in shardGroups)
+            foreach ((int shardIndex, (HashSet<int>? indexes, long minAddress)) in shardGroups)
             {
-                _logger?.LogDebug("GetEarliestTimestamp: searching shard {ShardIndex} with {DeviceCount} devices from address {MinAddress}",
-                    shardIndex, devices.Count, minAddress);
+                _logger?.LogDebug("GetEarliestTimestamp: searching shard {ShardIndex} with {Count} indexes from address {MinAddress}",
+                    shardIndex, indexes.Count, minAddress);
 
-                long? shardMin = _shards[shardIndex].FindFirstTimestamp(devices, minAddress, fromTs, getTimestamp);
+                long? shardMin = _shards[shardIndex].FindFirstTimestamp(indexes, minAddress, fromTs);
 
                 _logger?.LogDebug("GetEarliestTimestamp: shard {ShardIndex} returned {ShardMin}",
                     shardIndex, shardMin?.ToString() ?? "null");
@@ -615,13 +600,107 @@ namespace WebServer.Storage
         }
 
         /// <summary>
+        /// Combined availability-check and range-read in a single operation. Scans forward
+        /// from <paramref name="fromTs"/>, discovers the first matching entry, then collects
+        /// a window of <paramref name="windowMs"/> milliseconds of data from that point.
+        ///
+        /// Returns <c>rangeEndMs = -1</c> when no data exists for any secondary index.
+        /// </summary>
+        public (long RangeEndMs, Dictionary<int, List<StreamEntry>> Data) ReadRangeFromAvailable(
+            IEnumerable<int> secondaryIndexes, long fromTs, long windowMs, int limit = 0)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+
+            _logger?.LogDebug("ReadRangeFromAvailable: secondaryIndexes=[{Indexes}], fromTs={FromTs}, windowMs={WindowMs}, limit={Limit}",
+                string.Join(", ", secondaryIndexes), fromTs, windowMs, limit);
+
+            // Group by shard
+            Dictionary<int, (HashSet<int> Indexes, long MinAddress)> shardGroups = new Dictionary<int, (HashSet<int> Indexes, long MinAddress)>();
+
+            foreach (int idx in secondaryIndexes)
+            {
+                int shardIndex = idx & ShardMask;
+                long addr = LookupNearestAddress(idx, fromTs);
+
+                if (shardGroups.TryGetValue(shardIndex, out (HashSet<int> Indexes, long MinAddress) group))
+                {
+                    group.Indexes.Add(idx);
+                    if (addr < group.MinAddress)
+                        shardGroups[shardIndex] = (group.Indexes, addr);
+                }
+                else
+                {
+                    shardGroups[shardIndex] = (new HashSet<int> { idx }, addr);
+                }
+            }
+
+            // Single scan per shard: find first entry and collect window in one pass.
+            long? globalMin = null;
+            List<(long? FirstTs, Dictionary<int, List<StreamEntry>> Data)> shardResults = new List<(long? FirstTs, Dictionary<int, List<StreamEntry>> Data)>(shardGroups.Count);
+
+            foreach ((int shardIndex, (HashSet<int>? indexes, long minAddress)) in shardGroups)
+            {
+                _logger?.LogDebug("ReadRangeFromAvailable: scanning shard {ShardIndex} with {Count} indexes from address {MinAddress}",
+                    shardIndex, indexes.Count, minAddress);
+
+                (long? FirstTimestamp, Dictionary<int, List<StreamEntry>> Data) result = _shards[shardIndex].FindAndScanRange(indexes, minAddress, fromTs, windowMs, limit);
+                shardResults.Add(result);
+
+                if (result.FirstTimestamp.HasValue && (!globalMin.HasValue || result.FirstTimestamp.Value < globalMin.Value))
+                    globalMin = result.FirstTimestamp;
+            }
+
+            if (!globalMin.HasValue)
+            {
+                _logger?.LogDebug("ReadRangeFromAvailable: no data found");
+                return (-1, new Dictionary<int, List<StreamEntry>>());
+            }
+
+            long rangeEndMs = globalMin.Value + windowMs;
+
+            // Merge shard results, trimming entries beyond the canonical window.
+            Dictionary<int, List<StreamEntry>> merged = new Dictionary<int, List<StreamEntry>>();
+            foreach ((long? firstTs, Dictionary<int, List<StreamEntry>>? data) in shardResults)
+            {
+                foreach ((int idx, List<StreamEntry>? items) in data)
+                {
+                    if (items.Count == 0)
+                        continue;
+
+                    // Trim entries that fall beyond rangeEndMs
+                    if (firstTs.HasValue && firstTs.Value != globalMin.Value && items[^1].Timestamp > rangeEndMs)
+                    {
+                        int lo = 0, hi = items.Count;
+                        while (lo < hi)
+                        {
+                            int mid = lo + (hi - lo) / 2;
+                            if (items[mid].Timestamp <= rangeEndMs)
+                                lo = mid + 1;
+                            else
+                                hi = mid;
+                        }
+                        if (lo < items.Count)
+                            items.RemoveRange(lo, items.Count - lo);
+                    }
+                    merged[idx] = items;
+                }
+            }
+
+            var totalItems = merged.Values.Sum(list => list.Count);
+            _logger?.LogDebug("ReadRangeFromAvailable: returned {TotalItems} items across {Count} indexes, rangeEndMs={RangeEndMs}",
+                totalItems, merged.Count, rangeEndMs);
+
+            return (rangeEndMs, merged);
+        }
+
+        /// <summary>
         /// Find the largest indexed timestamp ≤ startTs for this device.
         /// Returns the corresponding FasterLog address, or 0 if no index entry exists (scan from beginning).
         /// </summary>
         private long LookupNearestAddress(int deviceId, long startTs)
         {
-            using var pooled = GetConnection();
-            using var cmd = pooled.Connection.CreateCommand();
+            using PooledConnection pooled = GetConnection();
+            using SqliteCommand cmd = pooled.Connection.CreateCommand();
             cmd.CommandText = "SELECT log_address FROM stream_index WHERE device_id = $did AND timestamp <= $ts ORDER BY timestamp DESC LIMIT 1";
             cmd.Parameters.AddWithValue("$did", deviceId);
             cmd.Parameters.AddWithValue("$ts", startTs);
@@ -632,6 +711,55 @@ namespace WebServer.Storage
                 deviceId, startTs, addr);
 
             return addr;
+        }
+
+        /// <summary>
+        /// Returns all distinct secondary indexes that have at least one indexed entry in the stream.
+        /// </summary>
+        private List<int> GetAllSecondaryIndexes()
+        {
+            using PooledConnection pooled = GetConnection();
+            using SqliteCommand cmd = pooled.Connection.CreateCommand();
+            cmd.CommandText = "SELECT DISTINCT device_id FROM stream_index";
+            List<int> ids = new List<int>();
+            using SqliteDataReader reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                ids.Add(reader.GetInt32(0));
+            }
+            return ids;
+        }
+
+        /// <summary>
+        /// Returns the single latest record for each secondary index that has data in the stream.
+        /// Uses the sparse index to efficiently locate the latest data region per index,
+        /// then scans forward from there to find the actual latest record.
+        /// </summary>
+        public Dictionary<int, StreamEntry> ReadLatest()
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+
+            List<int> indexIds = GetAllSecondaryIndexes();
+            _logger?.LogDebug("ReadLatest: found {Count} index(es) in index", indexIds.Count);
+
+            Dictionary<int, StreamEntry> result = new Dictionary<int, StreamEntry>(indexIds.Count);
+
+            foreach (int idx in indexIds)
+            {
+                // Find the latest sparse index entry
+                long scanFrom = LookupNearestAddress(idx, long.MaxValue);
+                LogShard shard = GetShard(idx);
+
+                // Scan from latest index entry to end of shard with no timestamp filter
+                List<StreamEntry> records = shard.ScanRange(idx, scanFrom, 0, long.MaxValue, 0);
+                if (records.Count > 0)
+                {
+                    result[idx] = records[^1]; // Keep only the latest record
+                }
+            }
+
+            _logger?.LogDebug("ReadLatest: returned latest data for {Count} index(es)", result.Count);
+            return result;
         }
 
         #endregion
@@ -661,9 +789,9 @@ namespace WebServer.Storage
                 _indexWriteLock.EnterWriteLock();
                 try
                 {
-                    var sw = Stopwatch.StartNew();
-                    using var pooled = GetConnection();
-                    using var cmd = pooled.Connection.CreateCommand();
+                    Stopwatch sw = Stopwatch.StartNew();
+                    using PooledConnection pooled = GetConnection();
+                    using SqliteCommand cmd = pooled.Connection.CreateCommand();
                     // This mode blocks (invokes the busy-handler callback) until there is no database writer and 
                     // all readers are reading from the most recent database snapshot. 
                     // It then checkpoints all frames in the log file and syncs the database file. 
@@ -674,7 +802,7 @@ namespace WebServer.Storage
                     // busy: number of frames that couldn't be checkpointed (0 = success)
                     // log: total frames in WAL before checkpoint
                     // checkpointed: frames actually checkpointed
-                    using var reader = cmd.ExecuteReader();
+                    using SqliteDataReader reader = cmd.ExecuteReader();
                     if (reader.Read())
                     {
                         int busy = reader.GetInt32(0);
@@ -759,8 +887,8 @@ namespace WebServer.Storage
         /// </summary>
         private void PurgeIndexBefore(long cutoffTs)
         {
-            using var pooled = GetConnection();
-            using var cmd = pooled.Connection.CreateCommand();
+            using PooledConnection pooled = GetConnection();
+            using SqliteCommand cmd = pooled.Connection.CreateCommand();
             cmd.CommandText = "DELETE FROM stream_index WHERE timestamp < $cutoff";
             cmd.Parameters.AddWithValue("$cutoff", cutoffTs);
             cmd.ExecuteNonQuery();
@@ -774,7 +902,7 @@ namespace WebServer.Storage
         {
             // For each shard, determine the safe truncation address.
             // Query the minimum log_address still alive in the index per shard.
-            using var pooled = GetConnection();
+            using PooledConnection pooled = GetConnection();
 
             for (int shardIndex = 0; shardIndex < ShardCount; shardIndex++)
             {
@@ -782,7 +910,7 @@ namespace WebServer.Storage
                 // and belong to devices assigned to this shard.
                 // Since we can't easily filter by shard in SQL (no shard column),
                 // we use the global minimum address for this shard from all devices.
-                using var cmd = pooled.Connection.CreateCommand();
+                using SqliteCommand cmd = pooled.Connection.CreateCommand();
                 cmd.CommandText =
                     """
                     SELECT MIN(log_address) FROM stream_index
@@ -810,8 +938,8 @@ namespace WebServer.Storage
         /// </summary>
         private long LookupNearestAddressForShard(int shardIndex, long startTs)
         {
-            using var pooled = GetConnection();
-            using var cmd = pooled.Connection.CreateCommand();
+            using PooledConnection pooled = GetConnection();
+            using SqliteCommand cmd = pooled.Connection.CreateCommand();
             cmd.CommandText = @"
                 SELECT MIN(log_address) 
                 FROM stream_index 
@@ -831,13 +959,13 @@ namespace WebServer.Storage
 
         private PooledConnection GetConnection()
         {
-            if (_connPool.TryDequeue(out var conn))
+            if (_connPool.TryDequeue(out SqliteConnection? conn))
                 return new PooledConnection(conn, _connPool);
 
             conn = new SqliteConnection(_connectionString);
             conn.Open();
 
-            using var pragma = conn.CreateCommand();
+            using SqliteCommand pragma = conn.CreateCommand();
             pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;";
             pragma.ExecuteNonQuery();
 
@@ -845,22 +973,7 @@ namespace WebServer.Storage
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private LogShard GetShard(int deviceId) => _shards[deviceId & ShardMask];
-
-        /// <summary>
-        /// Reads a device ID from raw bytes and converts it to int for shard selection and indexing.
-        /// Supports ushort (regular telemetry) and uint (ADSB data).
-        /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static int ReadDeviceIdAsInt(ReadOnlySpan<byte> data)
-        {
-            if (typeof(TDeviceId) == typeof(ushort))
-                return MemoryMarshal.Read<ushort>(data);
-            if (typeof(TDeviceId) == typeof(uint))
-                return (int)MemoryMarshal.Read<uint>(data);
-
-            throw new NotSupportedException($"Device ID type {typeof(TDeviceId)} is not supported. Only ushort and uint are supported.");
-        }
+        private LogShard GetShard(int secondaryIndex) => _shards[secondaryIndex & ShardMask];
         #endregion
 
         public void Dispose()
@@ -894,13 +1007,13 @@ namespace WebServer.Storage
             _indexWriteLock.Dispose();
 
             // Dispose shards (commits FasterLog)
-            foreach (var shard in _shards)
+            foreach (LogShard shard in _shards)
             {
                 shard.Dispose();
             }
 
             // Dispose connection pool
-            while (_connPool.TryDequeue(out var conn))
+            while (_connPool.TryDequeue(out SqliteConnection? conn))
             {
                 conn.Dispose();
             }
@@ -912,8 +1025,8 @@ namespace WebServer.Storage
         }
 
         /// <summary>
-        /// A single FasterLog shard shared by multiple devices.
-        /// Devices are assigned to shards via <c>deviceId &amp; ShardMask</c>.
+        /// A single FasterLog shard shared by multiple secondary indexes.
+        /// Entries are assigned to shards via <c>secondaryIndex &amp; ShardMask</c>.
         /// </summary>
         private sealed class LogShard : IDisposable
         {
@@ -924,51 +1037,52 @@ namespace WebServer.Storage
 
             public LogShard(int shardIndex, string baseDir)
             {
-                string logPath = Path.Combine(baseDir, shardIndex.ToString(), string.Format(Constants.ShardLogFmt, shardIndex));
-                var settings = new FasterLogSettings
+                string logPath = Path.Combine(baseDir, shardIndex.ToString(), string.Format(ShardLogFmt, shardIndex));
+                FasterLogSettings settings = new FasterLogSettings
                 {
                     LogDevice = Devices.CreateLogDevice(logPath, deleteOnClose: false),
-                    // PageSizeBits = 22,   // 4 MB pages
-                    // MemorySizeBits = 24, // 16 MB in-memory
                     TryRecoverLatest = true,
                     AutoRefreshSafeTailAddress = true,
-                    // AutoCommit = true,
-                    // LogCommitPolicy = LogCommitPolicy.RateLimit(1_000, 1024 * 1024 * 1024) // 1 mb/s or 1 second, whichever comes first
                 };
                 _log = new FasterLog(settings);
             }
 
-            public long Enqueue(in T item)
+            /// <summary>
+            /// Write a record with header + payload to the log.
+            /// Header: [8B timestamp][4B secondaryIndex][2B version][2B payloadLength]
+            /// </summary>
+            public long Enqueue(int secondaryIndex, ReadOnlySpan<byte> payload, long timestamp, ushort version)
             {
-                ReadOnlySpan<byte> payload = MemoryMarshal.AsBytes(new ReadOnlySpan<T>(in item));
-                return _log.Enqueue(payload);
+                int totalSize = StreamHeader.Size + payload.Length;
+                Span<byte> buffer = totalSize <= 256
+                    ? stackalloc byte[totalSize]
+                    : new byte[totalSize];
+
+                StreamHeader.Write(buffer, timestamp, secondaryIndex, version, (ushort)payload.Length);
+                payload.CopyTo(buffer[StreamHeader.Size..]);
+
+                return _log.Enqueue(buffer);
             }
 
             /// <summary>
-            /// Scan the shard from <paramref name="fromAddress"/> and collect items belonging to
-            /// <paramref name="deviceId"/> whose timestamp falls within [startTs, endTs].
-            /// Delegates to the multi-device overload with a single-element set.
+            /// Single-index scan. Delegates to the multi-index overload.
             /// </summary>
-            public List<T> ScanRange(int deviceId, long fromAddress, long startTs, long endTs, Func<T, long> getTimestamp, int limit = 0)
+            public List<StreamEntry> ScanRange(int secondaryIndex, long fromAddress, long startTs, long endTs, int limit = 0)
             {
-                var results = ScanRange(new HashSet<int>(1) { deviceId }, fromAddress, startTs, endTs, getTimestamp, limit);
-                return results[deviceId];
+                Dictionary<int, List<StreamEntry>> results = ScanRange(new HashSet<int>(1) { secondaryIndex }, fromAddress, startTs, endTs, limit);
+                return results[secondaryIndex];
             }
 
             /// <summary>
-            /// Scan the shard once from <paramref name="fromAddress"/> and collect items for all
-            /// devices in <paramref name="deviceIds"/> whose timestamps fall within [startTs, endTs].
-            /// Returns a dictionary keyed by deviceId.
-            ///
-            /// Because multiple devices share this shard, entries are interleaved.
-            /// Per-device timestamps are monotonic, so once a device passes <paramref name="endTs"/>
-            /// it is marked finished; the scan ends when every device is finished.
+            /// Scan the shard once from <paramref name="fromAddress"/> and collect entries for all
+            /// secondary indexes in <paramref name="indexes"/> whose timestamps fall within [startTs, endTs].
+            /// Timestamps are read from the header (primary index), secondary indexes from the header.
             /// </summary>
-            public Dictionary<int, List<T>> ScanRange(HashSet<int> deviceIds, long fromAddress, long startTs, long endTs, Func<T, long> getTimestamp, int limit = 0)
+            public Dictionary<int, List<StreamEntry>> ScanRange(HashSet<int> indexes, long fromAddress, long startTs, long endTs, int limit = 0)
             {
-                var results = new Dictionary<int, List<T>>(deviceIds.Count);
-                foreach (int id in deviceIds)
-                    results[id] = new List<T>();
+                Dictionary<int, List<StreamEntry>> results = new Dictionary<int, List<StreamEntry>>(indexes.Count);
+                foreach (int id in indexes)
+                    results[id] = new List<StreamEntry>();
 
                 long beginAddr = Math.Max(fromAddress, _log.BeginAddress);
                 long tailAddr = _log.SafeTailAddress;
@@ -976,43 +1090,43 @@ namespace WebServer.Storage
                 if (beginAddr >= tailAddr)
                     return results;
 
-                // Track which devices have passed endTs or hit the limit so we can stop early when all are done.
-                var finished = new HashSet<int>();
+                HashSet<int> finished = new HashSet<int>();
                 bool hasLimit = limit > 0;
-
-                int itemSize = Unsafe.SizeOf<T>();
 
                 using FasterLogScanIterator iter = _log.Scan(beginAddr, tailAddr, scanUncommitted: true);
                 while (iter.GetNext(out byte[] entry, out int entryLength, out _))
                 {
-                    if (entryLength < itemSize)
+                    if (entryLength < StreamHeader.Size)
                         continue;
 
-                    // All telemetry structs have a device ID field at offset 0 (ushort for regular telemetry, uint for ADSB).
-                    // Fast-path filter: skip entries from other devices without deserializing the full struct.
-                    int entryDeviceId = ReadDeviceIdAsInt(entry.AsSpan(0, Unsafe.SizeOf<TDeviceId>()));
-                    if (!deviceIds.Contains(entryDeviceId) || finished.Contains(entryDeviceId))
+                    // Read secondary index from header for fast-path filtering
+                    int entryIdx = StreamHeader.ReadSecondaryIndex(entry.AsSpan());
+                    if (!indexes.Contains(entryIdx) || finished.Contains(entryIdx))
                         continue;
 
-                    T item = MemoryMarshal.Read<T>(entry.AsSpan(0, entryLength));
-                    long ts = getTimestamp(item);
+                    long ts = StreamHeader.ReadTimestamp(entry.AsSpan());
 
                     if (ts > endTs)
                     {
-                        finished.Add(entryDeviceId);
-                        if (finished.Count == deviceIds.Count)
-                            break; // All devices past endTs
+                        finished.Add(entryIdx);
+                        if (finished.Count == indexes.Count)
+                            break;
                         continue;
                     }
 
                     if (ts >= startTs)
                     {
-                        results[entryDeviceId].Add(item);
+                        ushort version = StreamHeader.ReadVersion(entry.AsSpan());
+                        ushort payloadLen = StreamHeader.ReadPayloadLength(entry.AsSpan());
+                        byte[] payload = new byte[payloadLen];
+                        entry.AsSpan(StreamHeader.Size, payloadLen).CopyTo(payload);
 
-                        if (hasLimit && results[entryDeviceId].Count >= limit)
+                        results[entryIdx].Add(new StreamEntry(ts, entryIdx, version, payload));
+
+                        if (hasLimit && results[entryIdx].Count >= limit)
                         {
-                            finished.Add(entryDeviceId);
-                            if (finished.Count == deviceIds.Count)
+                            finished.Add(entryIdx);
+                            if (finished.Count == indexes.Count)
                                 break;
                         }
                     }
@@ -1022,53 +1136,54 @@ namespace WebServer.Storage
             }
 
             /// <summary>
-            /// Scan the shard from <paramref name="fromAddress"/> and collect items for all devices
-            /// whose timestamps fall within [startTs, endTs]. Returns a dictionary keyed by deviceId,
-            /// lazily creating entries as devices are discovered during the scan.
+            /// Scan the shard from <paramref name="fromAddress"/> and collect entries for all secondary indexes
+            /// whose timestamps fall within [startTs, endTs]. Lazily creates result lists.
             /// </summary>
-            public Dictionary<int, List<T>> ScanRangeAllDevices(long fromAddress, long startTs, long endTs, Func<T, long> getTimestamp, int limit = 0)
+            public Dictionary<int, List<StreamEntry>> ScanRangeAllDevices(long fromAddress, long startTs, long endTs, int limit = 0)
             {
-                var results = new Dictionary<int, List<T>>();
+                Dictionary<int, List<StreamEntry>> results = new Dictionary<int, List<StreamEntry>>();
                 long beginAddr = Math.Max(fromAddress, _log.BeginAddress);
                 long tailAddr = _log.SafeTailAddress;
 
                 if (beginAddr >= tailAddr)
                     return results;
 
-                var finished = new HashSet<int>();
+                HashSet<int> finished = new HashSet<int>();
                 bool hasLimit = limit > 0;
 
-                int itemSize = Unsafe.SizeOf<T>();
                 using FasterLogScanIterator iter = _log.Scan(beginAddr, tailAddr, scanUncommitted: true);
                 while (iter.GetNext(out byte[] entry, out int entryLength, out _))
                 {
-                    if (entryLength < itemSize)
+                    if (entryLength < StreamHeader.Size)
                         continue;
 
-                    int entryDeviceId = ReadDeviceIdAsInt(entry.AsSpan(0, Unsafe.SizeOf<TDeviceId>()));
-                    if (finished.Contains(entryDeviceId))
+                    int entryIdx = StreamHeader.ReadSecondaryIndex(entry.AsSpan());
+                    if (finished.Contains(entryIdx))
                         continue;
 
-                    T item = MemoryMarshal.Read<T>(entry.AsSpan(0, entryLength));
-                    long ts = getTimestamp(item);
+                    long ts = StreamHeader.ReadTimestamp(entry.AsSpan());
 
                     if (ts > endTs)
                     {
-                        finished.Add(entryDeviceId);
+                        finished.Add(entryIdx);
                         continue;
                     }
 
                     if (ts >= startTs)
                     {
-                        // Lazily create result lists only when we have data to add
-                        if (!results.ContainsKey(entryDeviceId))
-                            results[entryDeviceId] = new List<T>();
+                        if (!results.ContainsKey(entryIdx))
+                            results[entryIdx] = new List<StreamEntry>();
 
-                        results[entryDeviceId].Add(item);
+                        ushort version = StreamHeader.ReadVersion(entry.AsSpan());
+                        ushort payloadLen = StreamHeader.ReadPayloadLength(entry.AsSpan());
+                        byte[] payload = new byte[payloadLen];
+                        entry.AsSpan(StreamHeader.Size, payloadLen).CopyTo(payload);
 
-                        if (hasLimit && results[entryDeviceId].Count >= limit)
+                        results[entryIdx].Add(new StreamEntry(ts, entryIdx, version, payload));
+
+                        if (hasLimit && results[entryIdx].Count >= limit)
                         {
-                            finished.Add(entryDeviceId);
+                            finished.Add(entryIdx);
                         }
                     }
                 }
@@ -1077,11 +1192,10 @@ namespace WebServer.Storage
             }
 
             /// <summary>
-            /// Scan the shard from <paramref name="fromAddress"/> and find the first entry
-            /// for any device in <paramref name="deviceIds"/> whose timestamp is ≥ <paramref name="fromTs"/>.
-            /// Returns the minimum such timestamp, or null if none found.
+            /// Scan the shard and find the first entry for any index in <paramref name="indexes"/>
+            /// whose timestamp is ≥ <paramref name="fromTs"/>. Returns null if none found.
             /// </summary>
-            public long? FindFirstTimestamp(HashSet<int> deviceIds, long fromAddress, long fromTs, Func<T, long> getTimestamp)
+            public long? FindFirstTimestamp(HashSet<int> indexes, long fromAddress, long fromTs)
             {
                 long beginAddr = Math.Max(fromAddress, _log.BeginAddress);
                 long tailAddr = _log.SafeTailAddress;
@@ -1089,20 +1203,17 @@ namespace WebServer.Storage
                 if (beginAddr >= tailAddr)
                     return null;
 
-                int itemSize = Unsafe.SizeOf<T>();
                 using FasterLogScanIterator iter = _log.Scan(beginAddr, tailAddr, scanUncommitted: true);
                 while (iter.GetNext(out byte[] entry, out int entryLength, out _))
                 {
-                    if (entryLength < itemSize)
+                    if (entryLength < StreamHeader.Size)
                         continue;
 
-                    int entryDeviceId = ReadDeviceIdAsInt(entry.AsSpan(0, Unsafe.SizeOf<TDeviceId>()));
-                    if (!deviceIds.Contains(entryDeviceId))
+                    int entryIdx = StreamHeader.ReadSecondaryIndex(entry.AsSpan());
+                    if (!indexes.Contains(entryIdx))
                         continue;
 
-                    T item = MemoryMarshal.Read<T>(entry.AsSpan(0, entryLength));
-                    long ts = getTimestamp(item);
-
+                    long ts = StreamHeader.ReadTimestamp(entry.AsSpan());
                     if (ts >= fromTs)
                         return ts;
                 }
@@ -1111,8 +1222,78 @@ namespace WebServer.Storage
             }
 
             /// <summary>
+            /// Single-pass combination of FindFirstTimestamp and ScanRange. Scans forward, skips
+            /// entries below <paramref name="fromTs"/>, and once the first matching entry is found,
+            /// collects all entries within [firstTs, firstTs + windowMs].
+            /// </summary>
+            public (long? FirstTimestamp, Dictionary<int, List<StreamEntry>> Data) FindAndScanRange(
+                HashSet<int> indexes, long fromAddress, long fromTs, long windowMs, int limit = 0)
+            {
+                Dictionary<int, List<StreamEntry>> results = new Dictionary<int, List<StreamEntry>>(indexes.Count);
+                foreach (int id in indexes)
+                    results[id] = new List<StreamEntry>();
+
+                long beginAddr = Math.Max(fromAddress, _log.BeginAddress);
+                long tailAddr = _log.SafeTailAddress;
+
+                if (beginAddr >= tailAddr)
+                    return (null, results);
+
+                long? firstTs = null;
+                long endTs = long.MaxValue;
+                HashSet<int> finished = new HashSet<int>();
+                bool hasLimit = limit > 0;
+
+                using FasterLogScanIterator iter = _log.Scan(beginAddr, tailAddr, scanUncommitted: true);
+                while (iter.GetNext(out byte[] entry, out int entryLength, out _))
+                {
+                    if (entryLength < StreamHeader.Size)
+                        continue;
+
+                    int entryIdx = StreamHeader.ReadSecondaryIndex(entry.AsSpan());
+                    if (!indexes.Contains(entryIdx) || finished.Contains(entryIdx))
+                        continue;
+
+                    long ts = StreamHeader.ReadTimestamp(entry.AsSpan());
+
+                    if (ts < fromTs)
+                        continue;
+
+                    // First matching entry defines the window
+                    if (!firstTs.HasValue)
+                    {
+                        firstTs = ts;
+                        endTs = ts + windowMs;
+                    }
+
+                    if (ts > endTs)
+                    {
+                        finished.Add(entryIdx);
+                        if (finished.Count == indexes.Count)
+                            break;
+                        continue;
+                    }
+
+                    ushort version = StreamHeader.ReadVersion(entry.AsSpan());
+                    ushort payloadLen = StreamHeader.ReadPayloadLength(entry.AsSpan());
+                    byte[] payload = new byte[payloadLen];
+                    entry.AsSpan(StreamHeader.Size, payloadLen).CopyTo(payload);
+
+                    results[entryIdx].Add(new StreamEntry(ts, entryIdx, version, payload));
+
+                    if (hasLimit && results[entryIdx].Count >= limit)
+                    {
+                        finished.Add(entryIdx);
+                        if (finished.Count == indexes.Count)
+                            break;
+                    }
+                }
+
+                return (firstTs, results);
+            }
+
+            /// <summary>
             /// Commit all pending writes to disk and wait until the specified address is durable.
-            /// This ensures durability before creating index entries that reference these log addresses.
             /// </summary>
             public ValueTask CommitAndWait(long untilAddress)
             {
