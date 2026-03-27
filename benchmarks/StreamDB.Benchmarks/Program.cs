@@ -136,9 +136,9 @@ public class WriteBenchmarks
     [Benchmark]
     public void SQLite_SequentialWrites()
     {
-        using var tx = _sqliteConn.BeginTransaction();
+        // Batch in chunks of 512 with a commit (fsync) per batch — matches StreamDB's FlushWorker pattern
+        const int batchSize = 512;
         using var cmd = _sqliteConn.CreateCommand();
-        cmd.Transaction = tx;
         cmd.CommandText = "INSERT INTO data (secondary_index, primary_index, version, payload) VALUES ($sidx, $pi, $ver, $payload)";
         var pSidx = cmd.Parameters.Add("$sidx", SqliteType.Integer);
         var pPi = cmd.Parameters.Add("$pi", SqliteType.Integer);
@@ -149,29 +149,42 @@ public class WriteBenchmarks
         pVer.Value = 1;
         pPayload.Value = _payloadBytes;
 
-        for (int i = 0; i < RecordCount; i++)
+        for (int start = 0; start < RecordCount; start += batchSize)
         {
-            pSidx.Value = i % 4;
-            pPi.Value = 1_000_000 + i;
-            cmd.ExecuteNonQuery();
+            int end = Math.Min(start + batchSize, RecordCount);
+            using var tx = _sqliteConn.BeginTransaction();
+            cmd.Transaction = tx;
+            for (int i = start; i < end; i++)
+            {
+                pSidx.Value = i % 4;
+                pPi.Value = 1_000_000 + i;
+                cmd.ExecuteNonQuery();
+            }
+            tx.Commit(); // fsync per batch
         }
-        tx.Commit();
     }
 
     [Benchmark]
     public void RocksDB_SequentialWrites()
     {
-        Span<byte> keyBuffer = stackalloc byte[12]; // 4B secondary_index + 8B primary_index
-        using var batch = new WriteBatch();
-        for (int i = 0; i < RecordCount; i++)
+        // Batch in chunks of 512 with a sync write per batch — matches StreamDB's FlushWorker pattern
+        const int batchSize = 512;
+        byte[] keyBuffer = new byte[12];
+
+        for (int start = 0; start < RecordCount; start += batchSize)
         {
-            int secondaryIndex = i % 4;
-            long primaryIndex = 1_000_000 + i;
-            MemoryMarshal.Write(keyBuffer, in secondaryIndex);
-            MemoryMarshal.Write(keyBuffer[4..], in primaryIndex);
-            batch.Put(keyBuffer.ToArray(), _payloadBytes);
+            int end = Math.Min(start + batchSize, RecordCount);
+            using var batch = new WriteBatch();
+            for (int i = start; i < end; i++)
+            {
+                int secondaryIndex = i % 4;
+                long primaryIndex = 1_000_000 + i;
+                MemoryMarshal.Write(keyBuffer.AsSpan(), in secondaryIndex);
+                MemoryMarshal.Write(keyBuffer.AsSpan(4), in primaryIndex);
+                batch.Put(keyBuffer.ToArray(), _payloadBytes);
+            }
+            _rocksDb.Write(batch, _syncWriteOptions); // fsync per batch
         }
-        _rocksDb.Write(batch, _syncWriteOptions);
     }
 
     private static void TryDelete(string? path)
@@ -280,28 +293,33 @@ public class ConcurrentWriteBenchmarks
     [Benchmark]
     public void SQLite_ConcurrentDeviceWrites()
     {
-        // SQLite only supports one writer — threads batch into per-device transactions serialized by lock
+        // SQLite only supports one writer — batch 512 per transaction, serialized by lock
+        const int batchSize = 512;
         Parallel.For(0, DeviceCount, deviceId =>
         {
-            lock (_sqliteLock)
+            for (int start = 0; start < WritesPerDevice; start += batchSize)
             {
-                using var tx = _sqliteConn.BeginTransaction();
-                using var cmd = _sqliteConn.CreateCommand();
-                cmd.Transaction = tx;
-                cmd.CommandText = "INSERT INTO data (secondary_index, primary_index, version, payload) VALUES ($sidx, $pi, $ver, $payload)";
-                var pSidx = cmd.Parameters.Add("$sidx", SqliteType.Integer);
-                var pPi = cmd.Parameters.Add("$pi", SqliteType.Integer);
-                cmd.Parameters.AddWithValue("$ver", 1);
-                cmd.Parameters.AddWithValue("$payload", _payloadBytes);
-                cmd.Prepare();
-
-                pSidx.Value = deviceId;
-                for (int i = 0; i < WritesPerDevice; i++)
+                int end = Math.Min(start + batchSize, WritesPerDevice);
+                lock (_sqliteLock)
                 {
-                    pPi.Value = 1_000_000 + i;
-                    cmd.ExecuteNonQuery();
+                    using var tx = _sqliteConn.BeginTransaction();
+                    using var cmd = _sqliteConn.CreateCommand();
+                    cmd.Transaction = tx;
+                    cmd.CommandText = "INSERT INTO data (secondary_index, primary_index, version, payload) VALUES ($sidx, $pi, $ver, $payload)";
+                    var pSidx = cmd.Parameters.Add("$sidx", SqliteType.Integer);
+                    var pPi = cmd.Parameters.Add("$pi", SqliteType.Integer);
+                    cmd.Parameters.AddWithValue("$ver", 1);
+                    cmd.Parameters.AddWithValue("$payload", _payloadBytes);
+                    cmd.Prepare();
+
+                    pSidx.Value = deviceId;
+                    for (int i = start; i < end; i++)
+                    {
+                        pPi.Value = 1_000_000 + i;
+                        cmd.ExecuteNonQuery();
+                    }
+                    tx.Commit();
                 }
-                tx.Commit();
             }
         });
     }
@@ -309,20 +327,25 @@ public class ConcurrentWriteBenchmarks
     [Benchmark]
     public void RocksDB_ConcurrentDeviceWrites()
     {
-        // Each device batches writes then syncs once — fair comparison to StreamDB's sharded approach
+        // Each device batches 512 writes then syncs — matches StreamDB's FlushWorker batch pattern
+        const int batchSize = 512;
         Parallel.For(0, DeviceCount, deviceId =>
         {
             byte[] keyBuffer = new byte[12];
-            using var batch = new WriteBatch();
-            for (int i = 0; i < WritesPerDevice; i++)
+            for (int start = 0; start < WritesPerDevice; start += batchSize)
             {
-                int sidx = deviceId;
-                long pi = 1_000_000 + i;
-                MemoryMarshal.Write(keyBuffer.AsSpan(), in sidx);
-                MemoryMarshal.Write(keyBuffer.AsSpan(4), in pi);
-                batch.Put(keyBuffer.ToArray(), _payloadBytes);
+                int end = Math.Min(start + batchSize, WritesPerDevice);
+                using var batch = new WriteBatch();
+                for (int i = start; i < end; i++)
+                {
+                    int sidx = deviceId;
+                    long pi = 1_000_000 + i;
+                    MemoryMarshal.Write(keyBuffer.AsSpan(), in sidx);
+                    MemoryMarshal.Write(keyBuffer.AsSpan(4), in pi);
+                    batch.Put(keyBuffer.ToArray(), _payloadBytes);
+                }
+                _rocksDb.Write(batch, _syncWriteOptions);
             }
-            _rocksDb.Write(batch, _syncWriteOptions);
         });
     }
 
