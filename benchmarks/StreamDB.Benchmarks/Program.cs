@@ -478,6 +478,21 @@ public class ReadBenchmarks
     }
 
     [Benchmark]
+    public int StreamDB_RangeReadPooled()
+    {
+        long startPi = BasePi + 10_000;
+        long endPi = startPi + 4000;
+        int count = 0;
+        _streamDb.ReadRangePooled(secondaryIndex: 0, startPrimaryIndex: startPi, endPrimaryIndex: endPi,
+            (in StreamDB.StreamEntryView entry) =>
+            {
+                count++;
+                return true; // continue scanning
+            });
+        return count;
+    }
+
+    [Benchmark]
     public int SQLite_RangeRead()
     {
         long startPi = BasePi + 10_000;

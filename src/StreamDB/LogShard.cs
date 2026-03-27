@@ -109,6 +109,51 @@ namespace StreamDB
         }
 
         /// <summary>
+        /// Zero-allocation single-index scan. Invokes <paramref name="handler"/> for each matching entry
+        /// with a <see cref="StreamEntryView"/> whose payload points directly into FasterLog's buffer.
+        /// No <c>byte[]</c> is allocated per entry — the handler must process or copy the payload inline.
+        /// </summary>
+        public void ScanRange(int secondaryIndex, long fromAddress, long startPrimaryIndex, long endPrimaryIndex, StreamEntryHandler handler)
+        {
+            long beginAddr = Math.Max(fromAddress, _log.BeginAddress);
+            long tailAddr = _log.SafeTailAddress;
+
+            if (beginAddr >= tailAddr)
+                return;
+
+            using FasterLogScanIterator iter = _log.Scan(beginAddr, tailAddr, scanUncommitted: true);
+            while (iter.GetNext(out byte[] entry, out int entryLength, out _))
+            {
+                if (entryLength < StreamHeader.Size)
+                    continue;
+
+                ReadOnlySpan<byte> header = entry.AsSpan();
+                int entryIdx = StreamHeader.ReadSecondaryIndex(header);
+                if (entryIdx != secondaryIndex)
+                    continue;
+
+                long pi = StreamHeader.ReadPrimaryIndex(header);
+
+                if (pi > endPrimaryIndex)
+                    break;
+
+                if (pi >= startPrimaryIndex)
+                {
+                    var view = new StreamEntryView
+                    {
+                        PrimaryIndex = pi,
+                        SecondaryIndex = entryIdx,
+                        Version = StreamHeader.ReadVersion(header),
+                        Payload = entry.AsSpan(StreamHeader.Size, StreamHeader.ReadPayloadLength(header))
+                    };
+
+                    if (!handler(in view))
+                        break;
+                }
+            }
+        }
+
+        /// <summary>
         /// Scan the shard once from <paramref name="fromAddress"/> and collect entries for all
         /// secondary indexes in <paramref name="indexes"/> whose primary indexes fall within [startPrimaryIndex, endPrimaryIndex].
         /// Primary indexes are read from the header, secondary indexes from the header.

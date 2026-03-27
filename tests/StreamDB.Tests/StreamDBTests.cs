@@ -268,6 +268,67 @@ public class StreamDBBasicTests
         Assert.That(results[0].Version, Is.EqualTo(1));
         Assert.That(results[1].Version, Is.EqualTo(2));
     }
+
+    [Test]
+    public void ReadRangePooled_InvokesHandlerForEachEntry()
+    {
+        for (int i = 0; i < 10; i++)
+            AppendPayload(1, 100 + i);
+
+        _db.WaitForPendingWrites();
+
+        var collected = new List<(long Pi, int Idx, ushort Ver)>();
+        _db.ReadRangePooled(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 109,
+            (in StreamEntryView entry) =>
+            {
+                collected.Add((entry.PrimaryIndex, entry.SecondaryIndex, entry.Version));
+                return true;
+            });
+
+        Assert.That(collected, Has.Count.EqualTo(10));
+        Assert.That(collected[0].Pi, Is.EqualTo(100));
+        Assert.That(collected[9].Pi, Is.EqualTo(109));
+    }
+
+    [Test]
+    public void ReadRangePooled_HandlerCanStopEarly()
+    {
+        for (int i = 0; i < 20; i++)
+            AppendPayload(1, 100 + i);
+
+        _db.WaitForPendingWrites();
+
+        int count = 0;
+        _db.ReadRangePooled(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 200,
+            (in StreamEntryView entry) =>
+            {
+                count++;
+                return count < 5; // stop after 5
+            });
+
+        Assert.That(count, Is.EqualTo(5));
+    }
+
+    [Test]
+    public void ReadRangePooled_PayloadIsReadable()
+    {
+        var registry = new StreamVersionRegistry();
+        registry.Register<TestPayload>(version: 1);
+
+        AppendPayload(1, 100, value: 77.7f);
+        _db.WaitForPendingWrites();
+
+        float capturedValue = 0;
+        _db.ReadRangePooled(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 100,
+            (in StreamEntryView entry) =>
+            {
+                var p = MemoryMarshal.Read<TestPayload>(entry.Payload);
+                capturedValue = p.Value;
+                return true;
+            });
+
+        Assert.That(capturedValue, Is.EqualTo(77.7f).Within(0.01f));
+    }
 }
 
 [TestFixture]

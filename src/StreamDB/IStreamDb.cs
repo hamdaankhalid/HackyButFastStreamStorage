@@ -78,5 +78,15 @@ namespace StreamDB
         /// Merges FasterLog and late arrivals, keeping whichever has the higher primary index.
         /// </summary>
         Dictionary<int, StreamEntry> ReadLatest();
+
+        /// <summary>
+        /// Zero-allocation range scan for a single secondary index. Invokes <paramref name="handler"/>
+        /// for each matching entry with a <see cref="StreamEntryView"/> whose payload references
+        /// temporary memory — no <c>byte[]</c> is allocated per entry. The handler must process or
+        /// copy the payload inline; it is invalid after the callback returns.
+        /// Return <c>false</c> from the handler to stop scanning early.
+        /// </summary>
+        /// <remarks>Late arrivals are not included in pooled scans. Use <see cref="ReadRange(int, long, long, int)"/> if late arrival coverage is needed.</remarks>
+        void ReadRangePooled(int secondaryIndex, long startPrimaryIndex, long endPrimaryIndex, StreamEntryHandler handler);
     }
 }

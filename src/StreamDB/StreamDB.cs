@@ -514,6 +514,26 @@ namespace StreamDB
         }
 
         /// <summary>
+        /// Zero-allocation range scan for a single secondary index. Invokes <paramref name="handler"/>
+        /// for each matching entry with a <see cref="StreamEntryView"/> whose payload references
+        /// FasterLog's internal buffer — no <c>byte[]</c> is allocated per entry.
+        ///
+        /// The handler must process or copy the payload inline; it is invalid after the callback returns.
+        /// Return <c>false</c> from the handler to stop scanning early.
+        ///
+        /// <b>Note:</b> Late arrivals are not included in pooled scans. If you need late arrivals,
+        /// use <see cref="ReadRange(int, long, long, int)"/> instead.
+        /// </summary>
+        public void ReadRangePooled(int secondaryIndex, long startPrimaryIndex, long endPrimaryIndex, StreamEntryHandler handler)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+
+            long scanFrom = LookupNearestAddress(secondaryIndex, startPrimaryIndex);
+            LogShard shard = GetShard(secondaryIndex);
+            shard.ScanRange(secondaryIndex, scanFrom, startPrimaryIndex, endPrimaryIndex, handler);
+        }
+
+        /// <summary>
         /// Multi-index overload of ReadRange. Groups secondary indexes by shard to minimize redundant scanning.
         /// For each shard, looks up the nearest address ≤ startPrimaryIndex across all indexes in that shard, 
         /// then scans once per shard to collect results for all indexes. Returns a dictionary keyed by secondary index.
@@ -789,13 +809,13 @@ namespace StreamDB
             if (Volatile.Read(ref _lateArrivalCount) > 0)
             {
                 Dictionary<int, StreamEntry> lateLatest = _lateArrivals.GetLatest();
-            foreach ((int idx, StreamEntry lateEntry) in lateLatest)
-            {
-                if (!result.TryGetValue(idx, out StreamEntry existing) || lateEntry.PrimaryIndex > existing.PrimaryIndex)
+                foreach ((int idx, StreamEntry lateEntry) in lateLatest)
                 {
-                    result[idx] = lateEntry;
+                    if (!result.TryGetValue(idx, out StreamEntry existing) || lateEntry.PrimaryIndex > existing.PrimaryIndex)
+                    {
+                        result[idx] = lateEntry;
+                    }
                 }
-            }
             }
 
             _logger?.LogDebug("ReadLatest: returned latest data for {Count} index(es)", result.Count);

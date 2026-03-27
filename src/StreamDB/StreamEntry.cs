@@ -79,4 +79,30 @@ namespace StreamDB
         /// <summary>Raw payload bytes (header excluded). Deserialize according to Version.</summary>
         byte[] Payload
     );
+
+    /// <summary>
+    /// A read-only view of a stream entry whose payload references pooled or temporary memory.
+    /// Used by <see cref="IStreamDb.ReadRangePooled"/> to avoid allocating a <c>byte[]</c> per entry.
+    /// The payload span is only valid for the duration of the callback invocation.
+    /// </summary>
+    public readonly ref struct StreamEntryView
+    {
+        /// <summary>Primary index — monotonic key used for range queries and ordering.</summary>
+        public long PrimaryIndex { get; init; }
+        /// <summary>Secondary index — used for sharding and filtering.</summary>
+        public int SecondaryIndex { get; init; }
+        /// <summary>Schema version of the payload.</summary>
+        public ushort Version { get; init; }
+        /// <summary>
+        /// Raw payload bytes. Only valid during the callback — do not store or capture this span.
+        /// Copy to a <c>byte[]</c> if you need to retain the data.
+        /// </summary>
+        public ReadOnlySpan<byte> Payload { get; init; }
+    }
+
+    /// <summary>
+    /// Delegate invoked for each matching entry during a pooled range scan.
+    /// Return <c>true</c> to continue scanning, <c>false</c> to stop early.
+    /// </summary>
+    public delegate bool StreamEntryHandler(in StreamEntryView entry);
 }
