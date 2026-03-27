@@ -27,6 +27,7 @@ if (Directory.Exists(dataDir)) Directory.Delete(dataDir, recursive: true);
 using var db = new StreamDB.StreamDB(
     baseDir: dataDir,
     retentionPeriod: TimeSpan.FromDays(7),
+    jitterWindow: 120, // tolerate 120 units of out-of-order primary index values
     logger: logger
 );
 
@@ -98,17 +99,32 @@ Console.WriteLine("Done writing.\n");
 // Late arrivals go to a SQLite side store and are merged into reads automatically.
 
 Console.WriteLine("── Late arrivals demo ──");
-Console.WriteLine("Writing 3 out-of-order entries for sensor 1 (primary indexes in the past)...");
+Console.WriteLine("Writing 3 out-of-order entries for sensor 1:");
+Console.WriteLine("  - 2 within jitter window (absorbed by FasterLog)");
+Console.WriteLine("  - 1 beyond jitter window (routed to SQLite side store)");
 
-for (int i = 0; i < 3; i++)
+// Within jitter window (basePi + 5*60 and basePi + 6*60 are within 120 of the max seen)
+for (int i = 0; i < 2; i++)
 {
     var lateReading = new SensorReading
     {
         Temperature = 99.0f + i,
         Humidity = 99.0f,
     };
-    // These primary indexes are before the max seen for sensor 1
-    long latePi = basePi + (5 * 60) + (i * 60); // minutes 5, 6, 7
+    // These are slightly behind the max — within the jitter window of 120
+    long latePi = basePi + (pointsPerSensor - 1) * 60 - 60 - (i * 30);
+    ReadOnlySpan<byte> latePayload = MemoryMarshal.AsBytes(new ReadOnlySpan<SensorReading>(in lateReading));
+    db.Append(primaryIndex: latePi, secondaryIndex: 1, version: 1, payload: latePayload);
+}
+
+// Beyond jitter window (far in the past)
+{
+    var lateReading = new SensorReading
+    {
+        Temperature = 99.9f,
+        Humidity = 99.0f,
+    };
+    long latePi = basePi + (5 * 60); // far behind the max — beyond jitter window
     ReadOnlySpan<byte> latePayload = MemoryMarshal.AsBytes(new ReadOnlySpan<SensorReading>(in lateReading));
     db.Append(primaryIndex: latePi, secondaryIndex: 1, version: 1, payload: latePayload);
 }
@@ -151,12 +167,13 @@ Console.WriteLine();
 
 StreamDbStats stats = db.GetStats();
 Console.WriteLine($"── Stats ──");
-Console.WriteLine($"  Scale up:      {stats.ScaleUp}");
-Console.WriteLine($"  Scale down:    {stats.ScaleDown}");
-Console.WriteLine($"  Dropped:       {stats.Dropped}");
-Console.WriteLine($"  Adaptive:      {stats.AdaptiveIdx}");
-Console.WriteLine($"  Pending:       {stats.PendingIdxQueueLen}");
-Console.WriteLine($"  Late arrivals: {stats.LateArrivals}");
+Console.WriteLine($"  Scale up:         {stats.ScaleUp}");
+Console.WriteLine($"  Scale down:       {stats.ScaleDown}");
+Console.WriteLine($"  Dropped:          {stats.Dropped}");
+Console.WriteLine($"  Adaptive:         {stats.AdaptiveIdx}");
+Console.WriteLine($"  Pending:          {stats.PendingIdxQueueLen}");
+Console.WriteLine($"  Late arrivals:    {stats.LateArrivals}");
+Console.WriteLine($"  Jitter absorbed:  {stats.JitterAbsorbed}");
 Console.WriteLine();
 
 // ── Cleanup ────────────────────────────────────────────────────────────────────

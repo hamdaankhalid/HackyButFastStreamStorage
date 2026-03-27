@@ -39,6 +39,7 @@ using StreamDB;
 var db = new StreamDB.StreamDB(
     baseDir: "my-streams",
     retentionPeriod: TimeSpan.FromDays(30),
+    jitterWindow: 120, // tolerate 120 units of out-of-order primary index values
     logger: logger
 );
 

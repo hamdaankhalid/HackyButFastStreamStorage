@@ -115,12 +115,17 @@ namespace StreamDB
         private readonly LateArrivalsStore _lateArrivals;
         private long _lateArrivalCount = 0;
 
+        // Jitter window: tolerate slightly out-of-order writes in FasterLog
+        private readonly long _jitterWindow;
+        private long _jitterAbsorbedCount = 0;
+
         #endregion
 
-        public StreamDB(string? baseDir = null, TimeSpan? retentionPeriod = null, TimeSpan? checkpointInterval = null, ILogger<StreamDB>? logger = null)
+        public StreamDB(string? baseDir = null, TimeSpan? retentionPeriod = null, TimeSpan? checkpointInterval = null, long jitterWindow = 0, ILogger<StreamDB>? logger = null)
         {
             _logger = logger;
             _baseDir = baseDir ?? "streams";
+            _jitterWindow = jitterWindow;
             Directory.CreateDirectory(_baseDir);
 
             _retentionPeriod = retentionPeriod ?? TimeSpan.FromDays(60);
@@ -401,18 +406,28 @@ namespace StreamDB
                 primaryIndex);
             if (primaryIndex < maxPi)
             {
-                Interlocked.Increment(ref _lateArrivalCount);
-                // Acquire read lock so late arrival writes are blocked during checkpoint (write lock)
-                _indexWriteLock.EnterReadLock();
-                try
+                if (_jitterWindow > 0 && primaryIndex >= maxPi - _jitterWindow)
                 {
-                    _lateArrivals.Insert(secondaryIndex, primaryIndex, version, payload);
+                    // Within jitter window — write to FasterLog (fast path)
+                    Interlocked.Increment(ref _jitterAbsorbedCount);
+                    // Fall through to normal FasterLog write path below
                 }
-                finally
+                else
                 {
-                    _indexWriteLock.ExitReadLock();
+                    // Beyond jitter window — route to side store
+                    Interlocked.Increment(ref _lateArrivalCount);
+                    // Acquire read lock so late arrival writes are blocked during checkpoint (write lock)
+                    _indexWriteLock.EnterReadLock();
+                    try
+                    {
+                        _lateArrivals.Insert(secondaryIndex, primaryIndex, version, payload);
+                    }
+                    finally
+                    {
+                        _indexWriteLock.ExitReadLock();
+                    }
+                    return;
                 }
-                return;
             }
 
             // Normal (monotonic) path: append to FasterLog
@@ -478,7 +493,8 @@ namespace StreamDB
                 Volatile.Read(ref _droppedIndexEntries),
                 Volatile.Read(ref _adaptiveIdx),
                 Volatile.Read(ref _pendingIndexCount),
-                Volatile.Read(ref _lateArrivalCount)
+                Volatile.Read(ref _lateArrivalCount),
+                Volatile.Read(ref _jitterAbsorbedCount)
             );
 
         #endregion
@@ -497,7 +513,7 @@ namespace StreamDB
                 secondaryIndex, scanFrom, secondaryIndex & ShardMask);
 
             LogShard shard = GetShard(secondaryIndex);
-            List<StreamEntry> results = shard.ScanRange(secondaryIndex, scanFrom, startPrimaryIndex, endPrimaryIndex, limit);
+            List<StreamEntry> results = shard.ScanRange(secondaryIndex, scanFrom, startPrimaryIndex, endPrimaryIndex, _jitterWindow, limit);
 
             // Only query the late arrivals store if there are any late arrivals
             if (Volatile.Read(ref _lateArrivalCount) > 0)
@@ -541,13 +557,13 @@ namespace StreamDB
             if (lateEntries == null)
             {
                 // Fast path: no late arrivals, pure zero-allocation scan
-                shard.ScanRange(secondaryIndex, scanFrom, startPrimaryIndex, endPrimaryIndex, handler);
+                shard.ScanRange(secondaryIndex, scanFrom, startPrimaryIndex, endPrimaryIndex, _jitterWindow, handler);
                 return;
             }
 
             // Merge path: interleave FasterLog scan with pre-fetched late arrivals in primary index order
             int lateIdx = 0;
-            shard.ScanRange(secondaryIndex, scanFrom, startPrimaryIndex, endPrimaryIndex,
+            shard.ScanRange(secondaryIndex, scanFrom, startPrimaryIndex, endPrimaryIndex, _jitterWindow,
                 (in StreamEntryView logEntry) =>
                 {
                     // Emit any late arrivals that come before this log entry
@@ -625,7 +641,7 @@ namespace StreamDB
                 _logger?.LogDebug("ReadRange (multi-index): scanning shard {ShardIndex} with {Count} indexes from address {MinAddress}",
                     shardIndex, indexes.Count, minAddress);
 
-                Dictionary<int, List<StreamEntry>> shardResults = _shards[shardIndex].ScanRange(indexes, minAddress, startPrimaryIndex, endPrimaryIndex, limit);
+                Dictionary<int, List<StreamEntry>> shardResults = _shards[shardIndex].ScanRange(indexes, minAddress, startPrimaryIndex, endPrimaryIndex, _jitterWindow, limit);
 
                 foreach ((int idx, List<StreamEntry>? items) in shardResults)
                 {
@@ -665,7 +681,7 @@ namespace StreamDB
                 _logger?.LogDebug("ReadRange (all-indexes): scanning shard {ShardIndex} from address {Address}",
                     shardIndex, addr);
 
-                Dictionary<int, List<StreamEntry>> shardResults = _shards[shardIndex].ScanRangeAll(addr, startPrimaryIndex, endPrimaryIndex, limit);
+                Dictionary<int, List<StreamEntry>> shardResults = _shards[shardIndex].ScanRangeAll(addr, startPrimaryIndex, endPrimaryIndex, _jitterWindow, limit);
 
                 foreach ((int idx, List<StreamEntry>? items) in shardResults)
                 {
@@ -848,7 +864,7 @@ namespace StreamDB
                 LogShard shard = GetShard(idx);
 
                 // Scan from latest index entry to end of shard with no primary index filter
-                List<StreamEntry> records = shard.ScanRange(idx, scanFrom, 0, long.MaxValue, 0);
+                List<StreamEntry> records = shard.ScanRange(idx, scanFrom, 0, long.MaxValue, 0, 0);
                 if (records.Count > 0)
                 {
                     result[idx] = records[^1]; // Keep only the latest record
@@ -1184,5 +1200,5 @@ namespace StreamDB
 
     }
 
-    public record class StreamDbStats(long ScaleUp, long ScaleDown, long Dropped, int AdaptiveIdx, long PendingIdxQueueLen, long LateArrivals);
+    public record class StreamDbStats(long ScaleUp, long ScaleDown, long Dropped, int AdaptiveIdx, long PendingIdxQueueLen, long LateArrivals, long JitterAbsorbed);
 }

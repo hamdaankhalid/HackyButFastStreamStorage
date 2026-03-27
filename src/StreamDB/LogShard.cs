@@ -62,8 +62,11 @@ namespace StreamDB
 
         /// <summary>
         /// Single-index scan. Optimized path that avoids HashSet/Dictionary allocation.
+        /// When <paramref name="jitterWindow"/> &gt; 0, extends early termination by that amount
+        /// to catch out-of-order entries written via the jitter window, but only includes
+        /// results within [startPrimaryIndex, endPrimaryIndex].
         /// </summary>
-        public List<StreamEntry> ScanRange(int secondaryIndex, long fromAddress, long startPrimaryIndex, long endPrimaryIndex, int limit = 0)
+        public List<StreamEntry> ScanRange(int secondaryIndex, long fromAddress, long startPrimaryIndex, long endPrimaryIndex, long jitterWindow, int limit = 0)
         {
             var results = new List<StreamEntry>();
 
@@ -74,6 +77,7 @@ namespace StreamDB
                 return results;
 
             bool hasLimit = limit > 0;
+            long terminateAt = endPrimaryIndex + jitterWindow;
 
             using FasterLogScanIterator iter = _log.Scan(beginAddr, tailAddr, scanUncommitted: true);
             while (iter.GetNext(out byte[] entry, out int entryLength, out _))
@@ -88,10 +92,10 @@ namespace StreamDB
 
                 long pi = StreamHeader.ReadPrimaryIndex(header);
 
-                if (pi > endPrimaryIndex)
+                if (pi > terminateAt)
                     break;
 
-                if (pi >= startPrimaryIndex)
+                if (pi >= startPrimaryIndex && pi <= endPrimaryIndex)
                 {
                     ushort version = StreamHeader.ReadVersion(header);
                     ushort payloadLen = StreamHeader.ReadPayloadLength(header);
@@ -112,14 +116,18 @@ namespace StreamDB
         /// Zero-allocation single-index scan. Invokes <paramref name="handler"/> for each matching entry
         /// with a <see cref="StreamEntryView"/> whose payload points directly into FasterLog's buffer.
         /// No <c>byte[]</c> is allocated per entry — the handler must process or copy the payload inline.
+        /// When <paramref name="jitterWindow"/> &gt; 0, extends early termination but only invokes
+        /// the handler for entries within [startPrimaryIndex, endPrimaryIndex].
         /// </summary>
-        public void ScanRange(int secondaryIndex, long fromAddress, long startPrimaryIndex, long endPrimaryIndex, StreamEntryHandler handler)
+        public void ScanRange(int secondaryIndex, long fromAddress, long startPrimaryIndex, long endPrimaryIndex, long jitterWindow, StreamEntryHandler handler)
         {
             long beginAddr = Math.Max(fromAddress, _log.BeginAddress);
             long tailAddr = _log.SafeTailAddress;
 
             if (beginAddr >= tailAddr)
                 return;
+
+            long terminateAt = endPrimaryIndex + jitterWindow;
 
             using FasterLogScanIterator iter = _log.Scan(beginAddr, tailAddr, scanUncommitted: true);
             while (iter.GetNext(out byte[] entry, out int entryLength, out _))
@@ -134,10 +142,10 @@ namespace StreamDB
 
                 long pi = StreamHeader.ReadPrimaryIndex(header);
 
-                if (pi > endPrimaryIndex)
+                if (pi > terminateAt)
                     break;
 
-                if (pi >= startPrimaryIndex)
+                if (pi >= startPrimaryIndex && pi <= endPrimaryIndex)
                 {
                     var view = new StreamEntryView
                     {
@@ -156,9 +164,10 @@ namespace StreamDB
         /// <summary>
         /// Scan the shard once from <paramref name="fromAddress"/> and collect entries for all
         /// secondary indexes in <paramref name="indexes"/> whose primary indexes fall within [startPrimaryIndex, endPrimaryIndex].
-        /// Primary indexes are read from the header, secondary indexes from the header.
+        /// When <paramref name="jitterWindow"/> &gt; 0, extends early termination but only includes
+        /// results within [startPrimaryIndex, endPrimaryIndex].
         /// </summary>
-        public Dictionary<int, List<StreamEntry>> ScanRange(HashSet<int> indexes, long fromAddress, long startPrimaryIndex, long endPrimaryIndex, int limit = 0)
+        public Dictionary<int, List<StreamEntry>> ScanRange(HashSet<int> indexes, long fromAddress, long startPrimaryIndex, long endPrimaryIndex, long jitterWindow, int limit = 0)
         {
             Dictionary<int, List<StreamEntry>> results = new Dictionary<int, List<StreamEntry>>(indexes.Count);
             foreach (int id in indexes)
@@ -172,6 +181,7 @@ namespace StreamDB
 
             HashSet<int> finished = new HashSet<int>();
             bool hasLimit = limit > 0;
+            long terminateAt = endPrimaryIndex + jitterWindow;
 
             using FasterLogScanIterator iter = _log.Scan(beginAddr, tailAddr, scanUncommitted: true);
             while (iter.GetNext(out byte[] entry, out int entryLength, out _))
@@ -188,7 +198,7 @@ namespace StreamDB
 
                 long pi = StreamHeader.ReadPrimaryIndex(header);
 
-                if (pi > endPrimaryIndex)
+                if (pi > terminateAt)
                 {
                     finished.Add(entryIdx);
                     if (finished.Count == indexes.Count)
@@ -196,7 +206,7 @@ namespace StreamDB
                     continue;
                 }
 
-                if (pi >= startPrimaryIndex)
+                if (pi >= startPrimaryIndex && pi <= endPrimaryIndex)
                 {
                     ushort version = StreamHeader.ReadVersion(header);
                     ushort payloadLen = StreamHeader.ReadPayloadLength(header);
@@ -220,8 +230,10 @@ namespace StreamDB
         /// <summary>
         /// Scan the shard from <paramref name="fromAddress"/> and collect entries for all secondary indexes
         /// whose primary indexes fall within [startPrimaryIndex, endPrimaryIndex]. Lazily creates result lists.
+        /// When <paramref name="jitterWindow"/> &gt; 0, extends early termination but only includes
+        /// results within [startPrimaryIndex, endPrimaryIndex].
         /// </summary>
-        public Dictionary<int, List<StreamEntry>> ScanRangeAll(long fromAddress, long startPrimaryIndex, long endPrimaryIndex, int limit = 0)
+        public Dictionary<int, List<StreamEntry>> ScanRangeAll(long fromAddress, long startPrimaryIndex, long endPrimaryIndex, long jitterWindow, int limit = 0)
         {
             Dictionary<int, List<StreamEntry>> results = new Dictionary<int, List<StreamEntry>>();
             long beginAddr = Math.Max(fromAddress, _log.BeginAddress);
@@ -232,6 +244,7 @@ namespace StreamDB
 
             HashSet<int> finished = new HashSet<int>();
             bool hasLimit = limit > 0;
+            long terminateAt = endPrimaryIndex + jitterWindow;
 
             using FasterLogScanIterator iter = _log.Scan(beginAddr, tailAddr, scanUncommitted: true);
             while (iter.GetNext(out byte[] entry, out int entryLength, out _))
@@ -246,13 +259,13 @@ namespace StreamDB
 
                 long pi = StreamHeader.ReadPrimaryIndex(header);
 
-                if (pi > endPrimaryIndex)
+                if (pi > terminateAt)
                 {
                     finished.Add(entryIdx);
                     continue;
                 }
 
-                if (pi >= startPrimaryIndex)
+                if (pi >= startPrimaryIndex && pi <= endPrimaryIndex)
                 {
                     if (!results.ContainsKey(entryIdx))
                         results[entryIdx] = new List<StreamEntry>();

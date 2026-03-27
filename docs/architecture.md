@@ -187,22 +187,40 @@ Console.WriteLine($"Queue Depth: {stats.PendingIdxQueueLen}");
 ### Late Arrivals (Out-of-Order Writes)
 
 StreamDB is optimized for monotonically increasing primary indexes, but handles occasional
-out-of-order writes transparently via a **late arrivals side store**:
+out-of-order writes transparently via a **three-way routing** mechanism:
 
 ```
-Normal write (pi ≥ maxPi):  → FasterLog (lock-free, fast)
-Late arrival (pi < maxPi):  → SQLite late_arrivals table (synchronous, correct)
+Normal write (pi ≥ maxPi):                      → FasterLog (lock-free, fast)
+Jitter write (pi ≥ maxPi - jitterWindow):        → FasterLog (fast path, no SQLite)
+Late arrival (pi < maxPi - jitterWindow):         → SQLite late_arrivals table (synchronous, correct)
+```
+
+The **jitter window** allows writes that are slightly out of order (within a configurable
+tolerance) to go directly to FasterLog instead of the SQLite side store. This is useful for
+workloads where data sources deliver records with small timing variations — for example,
+distributed sensors whose clocks are slightly skewed.
+
+Configure the jitter window via the `jitterWindow` constructor parameter (default: `0`, meaning
+no jitter tolerance — all out-of-order writes go to the side store):
+
+```csharp
+var db = new StreamDB(jitterWindow: 120); // tolerate 120 units of out-of-order
 ```
 
 - On `Append`: tracks `maxPrimaryIndex` per secondary index. If the incoming primary index is
-  lower than the max seen, the entry is stored in a `late_arrivals` SQLite table instead of FasterLog.
-- On `ReadRange`: merges FasterLog scan results with a `late_arrivals` query, producing
-  a correctly-ordered result transparently.
+  lower than the max seen but within the jitter window, the entry is written to FasterLog.
+  If it is below `maxPi - jitterWindow`, it is stored in the `late_arrivals` SQLite table.
+- On `ReadRange`: scans extend past `endPrimaryIndex` by `jitterWindow` to ensure jitter
+  entries (which may appear in the log after higher-primary-index entries) are not missed by
+  early termination. Results are then filtered to the requested `[startPrimaryIndex, endPrimaryIndex]` range.
+  Late arrivals from SQLite are merged as before.
 - On retention: `late_arrivals` entries older than the retention cutoff are purged alongside
   the sparse index.
 
-**Performance impact:** Zero for the monotonic (normal) path. Late arrivals incur a synchronous
-SQLite write, which is acceptable for infrequent out-of-order data.
+**Performance impact:** Zero for the monotonic (normal) path. Jitter-absorbed writes are as
+fast as normal writes (no SQLite). Late arrivals beyond the jitter window incur a synchronous
+SQLite write, which is acceptable for infrequent out-of-order data. Reads with a non-zero
+jitter window scan slightly further but skip non-matching entries efficiently.
 
 ## Read Path Details
 
@@ -347,6 +365,7 @@ public StreamDB(
     string? baseDir = null,              // Default: "streams"
     TimeSpan? retentionPeriod = null,    // Default: 60 days
     TimeSpan? checkpointInterval = null, // Default: 1 hour
+    long jitterWindow = 0,              // Default: 0 (no jitter tolerance)
     ILogger<StreamDB>? logger = null
 )
 ```
