@@ -274,26 +274,34 @@ public class ConcurrentWriteBenchmarks
                     payload: payload);
             }
         });
+        _streamDb.WaitForPendingWrites();
     }
 
     [Benchmark]
     public void SQLite_ConcurrentDeviceWrites()
     {
-        // SQLite only supports one writer — threads must serialize
+        // SQLite only supports one writer — threads batch into per-device transactions serialized by lock
         Parallel.For(0, DeviceCount, deviceId =>
         {
-            for (int i = 0; i < WritesPerDevice; i++)
+            lock (_sqliteLock)
             {
-                lock (_sqliteLock)
+                using var tx = _sqliteConn.BeginTransaction();
+                using var cmd = _sqliteConn.CreateCommand();
+                cmd.Transaction = tx;
+                cmd.CommandText = "INSERT INTO data (secondary_index, primary_index, version, payload) VALUES ($sidx, $pi, $ver, $payload)";
+                var pSidx = cmd.Parameters.Add("$sidx", SqliteType.Integer);
+                var pPi = cmd.Parameters.Add("$pi", SqliteType.Integer);
+                cmd.Parameters.AddWithValue("$ver", 1);
+                cmd.Parameters.AddWithValue("$payload", _payloadBytes);
+                cmd.Prepare();
+
+                pSidx.Value = deviceId;
+                for (int i = 0; i < WritesPerDevice; i++)
                 {
-                    using var cmd = _sqliteConn.CreateCommand();
-                    cmd.CommandText = "INSERT INTO data (secondary_index, primary_index, version, payload) VALUES ($sidx, $pi, $ver, $payload)";
-                    cmd.Parameters.AddWithValue("$sidx", deviceId);
-                    cmd.Parameters.AddWithValue("$pi", 1_000_000 + i);
-                    cmd.Parameters.AddWithValue("$ver", 1);
-                    cmd.Parameters.AddWithValue("$payload", _payloadBytes);
+                    pPi.Value = 1_000_000 + i;
                     cmd.ExecuteNonQuery();
                 }
+                tx.Commit();
             }
         });
     }
@@ -301,18 +309,20 @@ public class ConcurrentWriteBenchmarks
     [Benchmark]
     public void RocksDB_ConcurrentDeviceWrites()
     {
-        // RocksDB supports concurrent writes but each needs its own sync
+        // Each device batches writes then syncs once — fair comparison to StreamDB's sharded approach
         Parallel.For(0, DeviceCount, deviceId =>
         {
             byte[] keyBuffer = new byte[12];
+            using var batch = new WriteBatch();
             for (int i = 0; i < WritesPerDevice; i++)
             {
                 int sidx = deviceId;
                 long pi = 1_000_000 + i;
                 MemoryMarshal.Write(keyBuffer.AsSpan(), in sidx);
                 MemoryMarshal.Write(keyBuffer.AsSpan(4), in pi);
-                _rocksDb.Put(keyBuffer, _payloadBytes, cf: null, _syncWriteOptions);
+                batch.Put(keyBuffer.ToArray(), _payloadBytes);
             }
+            _rocksDb.Write(batch, _syncWriteOptions);
         });
     }
 

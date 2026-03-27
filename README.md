@@ -60,19 +60,12 @@ StreamDbStats stats = db.GetStats();
 ## Project Structure
 
 ```
-StreamDB.sln
-├── src/StreamDB/              # Class library
-│   ├── StreamDB.cs            # Core storage engine
-│   ├── LogShard.cs            # FasterLog shard wrapper
-│   ├── LateArrivalsStore.cs   # Out-of-order write side store
-│   ├── StreamEntry.cs         # Record header layout and entry struct
-│   ├── StreamVersionRegistry.cs # Payload versioning utility
-│   └── PooledConnection.cs    # SQLite connection pool
-├── samples/StreamDB.Sample/   # Console app demo
-│   └── Program.cs             # Write + read + late arrivals + stats example
-├── docs/
-│   └── architecture.md        # Full technical documentation
-└── LICENSE
+├── src/StreamDB/              # Core library
+├── samples/StreamDB.Sample/   # Console demo
+├── tests/StreamDB.Tests/      # NUnit test suite
+├── benchmarks/StreamDB.Benchmarks/ # BenchmarkDotNet vs SQLite & RocksDB
+├── docs/architecture.md       # Technical documentation
+└── LICENSE                    # Apache 2.0
 ```
 
 ### Running the Sample
