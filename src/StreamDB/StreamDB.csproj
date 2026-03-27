@@ -5,9 +5,24 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <RootNamespace>StreamDB</RootNamespace>
+
+    <!-- NuGet package metadata -->
+    <PackageId>StreamDB</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>Hamdaan Khalid</Authors>
     <Description>High-throughput schema-on-read stream storage engine for time-series data, built on FASTER and SQLite.</Description>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <RepositoryUrl>https://github.com/hamdaankhalid/HackyButFastStreamStorage</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>time-series;stream;iot;telemetry;fasterlog;embedded;append-only</PackageTags>
+    <PackageProjectUrl>https://github.com/hamdaankhalid/HackyButFastStreamStorage</PackageProjectUrl>
+    <Copyright>Copyright 2025 Hamdaan Khalid</Copyright>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="../../README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.5" />
