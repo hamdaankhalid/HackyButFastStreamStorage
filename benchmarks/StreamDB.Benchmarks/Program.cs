@@ -64,10 +64,10 @@ public class WriteBenchmarks
         create.CommandText = """
             CREATE TABLE IF NOT EXISTS data (
                 secondary_index INTEGER NOT NULL,
-                timestamp INTEGER NOT NULL,
+                primary_index INTEGER NOT NULL,
                 version INTEGER NOT NULL,
                 payload BLOB NOT NULL,
-                PRIMARY KEY (secondary_index, timestamp)
+                PRIMARY KEY (secondary_index, primary_index)
             ) WITHOUT ROWID;
             """;
         create.ExecuteNonQuery();
@@ -97,10 +97,10 @@ public class WriteBenchmarks
         for (int i = 0; i < RecordCount; i++)
         {
             _streamDb.Append(
+                primaryIndex: 1_000_000 + i,
                 secondaryIndex: i % 4,
-                payload: _payloadBytes,
-                timestamp: 1_000_000 + i,
-                version: 1);
+                version: 1,
+                payload: _payloadBytes);
         }
         _streamDb.WaitForPendingWrites();
     }
@@ -111,9 +111,9 @@ public class WriteBenchmarks
         using var tx = _sqliteConn.BeginTransaction();
         using var cmd = _sqliteConn.CreateCommand();
         cmd.Transaction = tx;
-        cmd.CommandText = "INSERT INTO data (secondary_index, timestamp, version, payload) VALUES ($sidx, $ts, $ver, $payload)";
+        cmd.CommandText = "INSERT INTO data (secondary_index, primary_index, version, payload) VALUES ($sidx, $pi, $ver, $payload)";
         var pSidx = cmd.Parameters.Add("$sidx", SqliteType.Integer);
-        var pTs = cmd.Parameters.Add("$ts", SqliteType.Integer);
+        var pPi = cmd.Parameters.Add("$pi", SqliteType.Integer);
         var pVer = cmd.Parameters.Add("$ver", SqliteType.Integer);
         var pPayload = cmd.Parameters.Add("$payload", SqliteType.Blob);
         cmd.Prepare();
@@ -124,7 +124,7 @@ public class WriteBenchmarks
         for (int i = 0; i < RecordCount; i++)
         {
             pSidx.Value = i % 4;
-            pTs.Value = 1_000_000 + i;
+            pPi.Value = 1_000_000 + i;
             cmd.ExecuteNonQuery();
         }
         tx.Commit();
@@ -133,14 +133,14 @@ public class WriteBenchmarks
     [Benchmark]
     public void RocksDB_SequentialWrites()
     {
-        Span<byte> keyBuffer = stackalloc byte[12]; // 4B secondary_index + 8B timestamp
+        Span<byte> keyBuffer = stackalloc byte[12]; // 4B secondary_index + 8B primary_index
         using var batch = new WriteBatch();
         for (int i = 0; i < RecordCount; i++)
         {
             int secondaryIndex = i % 4;
-            long timestamp = 1_000_000 + i;
+            long primaryIndex = 1_000_000 + i;
             MemoryMarshal.Write(keyBuffer, in secondaryIndex);
-            MemoryMarshal.Write(keyBuffer[4..], in timestamp);
+            MemoryMarshal.Write(keyBuffer[4..], in primaryIndex);
             batch.Put(keyBuffer.ToArray(), _payloadBytes);
         }
         _rocksDb.Write(batch);
@@ -169,7 +169,7 @@ public class ReadBenchmarks
 
     private const int TotalRecords = 100_000;
     private const int SecondaryIndexCount = 4;
-    private const long BaseTs = 1_000_000;
+    private const long BasePi = 1_000_000;
 
     [GlobalSetup]
     public void Setup()
@@ -185,7 +185,7 @@ public class ReadBenchmarks
         _streamDbDir = Path.Combine(baseTmp, "streamdb");
         _streamDb = new StreamDB.StreamDB(baseDir: _streamDbDir);
         for (int i = 0; i < TotalRecords; i++)
-            _streamDb.Append(i % SecondaryIndexCount, payloadBytes, BaseTs + i, 1);
+            _streamDb.Append(BasePi + i, i % SecondaryIndexCount, 1, payloadBytes);
         _streamDb.WaitForPendingWrites();
 
         // SQLite setup
@@ -203,10 +203,10 @@ public class ReadBenchmarks
             create.CommandText = """
                 CREATE TABLE IF NOT EXISTS data (
                     secondary_index INTEGER NOT NULL,
-                    timestamp INTEGER NOT NULL,
+                    primary_index INTEGER NOT NULL,
                     version INTEGER NOT NULL,
                     payload BLOB NOT NULL,
-                    PRIMARY KEY (secondary_index, timestamp)
+                    PRIMARY KEY (secondary_index, primary_index)
                 ) WITHOUT ROWID;
                 """;
             create.ExecuteNonQuery();
@@ -215,16 +215,16 @@ public class ReadBenchmarks
         {
             using var cmd = _sqliteConn.CreateCommand();
             cmd.Transaction = tx;
-            cmd.CommandText = "INSERT INTO data (secondary_index, timestamp, version, payload) VALUES ($sidx, $ts, $ver, $payload)";
+            cmd.CommandText = "INSERT INTO data (secondary_index, primary_index, version, payload) VALUES ($sidx, $pi, $ver, $payload)";
             var pSidx = cmd.Parameters.Add("$sidx", SqliteType.Integer);
-            var pTs = cmd.Parameters.Add("$ts", SqliteType.Integer);
+            var pPi = cmd.Parameters.Add("$pi", SqliteType.Integer);
             cmd.Parameters.AddWithValue("$ver", 1);
             cmd.Parameters.AddWithValue("$payload", payloadBytes);
             cmd.Prepare();
             for (int i = 0; i < TotalRecords; i++)
             {
                 pSidx.Value = i % SecondaryIndexCount;
-                pTs.Value = BaseTs + i;
+                pPi.Value = BasePi + i;
                 cmd.ExecuteNonQuery();
             }
             tx.Commit();
@@ -240,9 +240,9 @@ public class ReadBenchmarks
             for (int i = 0; i < TotalRecords; i++)
             {
                 int sidx = i % SecondaryIndexCount;
-                long ts = BaseTs + i;
+                long pi = BasePi + i;
                 MemoryMarshal.Write(keyBuffer, in sidx);
-                MemoryMarshal.Write(keyBuffer[4..], in ts);
+                MemoryMarshal.Write(keyBuffer[4..], in pi);
                 batch.Put(keyBuffer.ToArray(), payloadBytes);
             }
             _rocksDb.Write(batch);
@@ -268,21 +268,21 @@ public class ReadBenchmarks
     public int StreamDB_RangeRead()
     {
         // Read 1000 entries for secondary index 0
-        long startTs = BaseTs + 10_000;
-        long endTs = startTs + 4000; // ~1000 entries at stride 4
-        var results = _streamDb.ReadRange(secondaryIndex: 0, startTs: startTs, endTs: endTs);
+        long startPi = BasePi + 10_000;
+        long endPi = startPi + 4000; // ~1000 entries at stride 4
+        var results = _streamDb.ReadRange(secondaryIndex: 0, startPrimaryIndex: startPi, endPrimaryIndex: endPi);
         return results.Count;
     }
 
     [Benchmark]
     public int SQLite_RangeRead()
     {
-        long startTs = BaseTs + 10_000;
-        long endTs = startTs + 4000;
+        long startPi = BasePi + 10_000;
+        long endPi = startPi + 4000;
         using var cmd = _sqliteConn.CreateCommand();
-        cmd.CommandText = "SELECT timestamp, secondary_index, version, payload FROM data WHERE secondary_index = 0 AND timestamp >= $start AND timestamp <= $end ORDER BY timestamp";
-        cmd.Parameters.AddWithValue("$start", startTs);
-        cmd.Parameters.AddWithValue("$end", endTs);
+        cmd.CommandText = "SELECT primary_index, secondary_index, version, payload FROM data WHERE secondary_index = 0 AND primary_index >= $start AND primary_index <= $end ORDER BY primary_index";
+        cmd.Parameters.AddWithValue("$start", startPi);
+        cmd.Parameters.AddWithValue("$end", endPi);
 
         int count = 0;
         using var reader = cmd.ExecuteReader();
@@ -293,16 +293,16 @@ public class ReadBenchmarks
     [Benchmark]
     public int RocksDB_RangeRead()
     {
-        long startTs = BaseTs + 10_000;
-        long endTs = startTs + 4000;
+        long startPi = BasePi + 10_000;
+        long endPi = startPi + 4000;
 
         byte[] startKey = new byte[12];
         byte[] endKey = new byte[12];
         int sidx = 0;
         MemoryMarshal.Write(startKey.AsSpan(), in sidx);
-        MemoryMarshal.Write(startKey.AsSpan(4), in startTs);
+        MemoryMarshal.Write(startKey.AsSpan(4), in startPi);
         MemoryMarshal.Write(endKey.AsSpan(), in sidx);
-        MemoryMarshal.Write(endKey.AsSpan(4), in endTs);
+        MemoryMarshal.Write(endKey.AsSpan(4), in endPi);
 
         int count = 0;
         using var iter = _rocksDb.NewIterator();
@@ -312,8 +312,8 @@ public class ReadBenchmarks
             var key = iter.Key();
             if (key.Length < 12) break;
             int keySidx = MemoryMarshal.Read<int>(key);
-            long keyTs = MemoryMarshal.Read<long>(key.AsSpan(4));
-            if (keySidx != 0 || keyTs > endTs) break;
+            long keyPi = MemoryMarshal.Read<long>(key.AsSpan(4));
+            if (keySidx != 0 || keyPi > endPi) break;
             count++;
             iter.Next();
         }

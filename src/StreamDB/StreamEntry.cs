@@ -7,17 +7,17 @@ namespace StreamDB
     /// <code>
     /// ┌──────────────┬────────────────┬──────────────┬─────────────────┬──────────────────┐
     /// │ 8B: long     │ 4B: int        │ 2B: ushort   │ 2B: ushort      │ N bytes: payload │
-    /// │ timestamp    │ secondary_idx  │ version      │ payload length  │ (opaque bytes)   │
+    /// │ primary_idx  │ secondary_idx  │ version      │ payload length  │ (opaque bytes)   │
     /// │ PRIMARY IDX  │ SECONDARY IDX  │              │                 │                  │
     /// └──────────────┴────────────────┴──────────────┴─────────────────┴──────────────────┘
     /// </code>
     /// </summary>
     public static class StreamHeader
     {
-        /// <summary>Total header size in bytes: timestamp(8) + secondaryIndex(4) + version(2) + payloadLength(2) = 16.</summary>
+        /// <summary>Total header size in bytes: primaryIndex(8) + secondaryIndex(4) + version(2) + payloadLength(2) = 16.</summary>
         public const int Size = 16;
 
-        public const int TimestampOffset = 0;
+        public const int PrimaryIndexOffset = 0;
         public const int SecondaryIndexOffset = 8;
         public const int VersionOffset = 12;
         public const int PayloadLengthOffset = 14;
@@ -26,17 +26,17 @@ namespace StreamDB
         /// Writes the header fields into the target span at the appropriate offsets.
         /// The caller must ensure <paramref name="target"/> has at least <see cref="Size"/> bytes.
         /// </summary>
-        public static void Write(Span<byte> target, long timestamp, int secondaryIndex, ushort version, ushort payloadLength)
+        public static void Write(Span<byte> target, long primaryIndex, int secondaryIndex, ushort version, ushort payloadLength)
         {
-            MemoryMarshal.Write(target[TimestampOffset..], in timestamp);
+            MemoryMarshal.Write(target[PrimaryIndexOffset..], in primaryIndex);
             MemoryMarshal.Write(target[SecondaryIndexOffset..], in secondaryIndex);
             MemoryMarshal.Write(target[VersionOffset..], in version);
             MemoryMarshal.Write(target[PayloadLengthOffset..], in payloadLength);
         }
 
-        /// <summary>Reads the primary index (timestamp) from the header.</summary>
-        public static long ReadTimestamp(ReadOnlySpan<byte> header) =>
-            MemoryMarshal.Read<long>(header[TimestampOffset..]);
+        /// <summary>Reads the primary index from the header.</summary>
+        public static long ReadPrimaryIndex(ReadOnlySpan<byte> header) =>
+            MemoryMarshal.Read<long>(header[PrimaryIndexOffset..]);
 
         /// <summary>Reads the secondary index from the header.</summary>
         public static int ReadSecondaryIndex(ReadOnlySpan<byte> header) =>
@@ -56,8 +56,8 @@ namespace StreamDB
     /// Callers deserialize the payload using the version field to select the appropriate struct type.
     /// </summary>
     public readonly record struct StreamEntry(
-        /// <summary>Primary index — timestamp/score used for range queries and ordering.</summary>
-        long Timestamp,
+        /// <summary>Primary index — monotonic key used for range queries and ordering (e.g. timestamp, sequence number).</summary>
+        long PrimaryIndex,
         /// <summary>Secondary index — used for sharding and filtering (e.g., device ID, sensor ID, user ID).</summary>
         int SecondaryIndex,
         /// <summary>Schema version of the payload, enabling format evolution.</summary>

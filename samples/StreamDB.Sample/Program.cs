@@ -24,8 +24,9 @@ Console.WriteLine();
 //
 // StreamDB uses two index concepts:
 //
-//   PRIMARY INDEX   = Timestamp (long) — used for time-range queries and ordering.
-//                     Every record carries a timestamp as its primary index.
+//   PRIMARY INDEX   = A monotonic long value used for range queries and ordering.
+//                     Commonly a Unix timestamp, but can be any monotonically
+//                     increasing value (sequence number, score, etc.).
 //
 //   SECONDARY INDEX = An integer grouping key — used for sharding and filtering.
 //                     This can represent anything: a device ID, sensor ID, user ID,
@@ -46,15 +47,15 @@ registry.Register<SensorReading>(version: 1);
 // Each Append call takes:
 //   secondaryIndex — the grouping key (here: sensor ID)
 //   payload        — raw bytes of your struct
-//   timestamp      — the primary index (here: Unix seconds)
+//   primaryIndex   — the primary index (here: Unix seconds)
 //   version        — schema version for payload evolution
 
 const int sensorCount = 4;
 const int pointsPerSensor = 50;
-long baseTs = DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 3600; // 1 hour ago
+long basePi = DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 3600; // 1 hour ago
 
 Console.WriteLine($"Writing {sensorCount * pointsPerSensor} records across {sensorCount} sensors...");
-Console.WriteLine($"  Primary index:   timestamp (Unix seconds)");
+Console.WriteLine($"  Primary index:   Unix seconds (monotonic)");
 Console.WriteLine($"  Secondary index: sensor ID (1–{sensorCount})");
 Console.WriteLine();
 
@@ -68,9 +69,9 @@ for (int sensorId = 1; sensorId <= sensorCount; sensorId++)
             Humidity = 45.0f + (i * 0.5f),
         };
 
-        long ts = baseTs + (i * 60); // one reading per minute
+        long pi = basePi + (i * 60); // one reading per minute
         ReadOnlySpan<byte> payload = MemoryMarshal.AsBytes(new ReadOnlySpan<SensorReading>(in reading));
-        db.Append(secondaryIndex: sensorId, payload: payload, timestamp: ts, version: 1);
+        db.Append(primaryIndex: pi, secondaryIndex: sensorId, version: 1, payload: payload);
     }
 }
 
@@ -79,11 +80,11 @@ db.WaitForPendingWrites();
 Console.WriteLine("Done writing.\n");
 
 // ── Late arrivals (out-of-order writes) ────────────────────────────────────────
-// StreamDB handles occasional out-of-order timestamps transparently.
+// StreamDB handles occasional out-of-order primary index values transparently.
 // Late arrivals go to a SQLite side store and are merged into reads automatically.
 
 Console.WriteLine("── Late arrivals demo ──");
-Console.WriteLine("Writing 3 out-of-order entries for sensor 1 (timestamps in the past)...");
+Console.WriteLine("Writing 3 out-of-order entries for sensor 1 (primary indexes in the past)...");
 
 for (int i = 0; i < 3; i++)
 {
@@ -92,28 +93,28 @@ for (int i = 0; i < 3; i++)
         Temperature = 99.0f + i,
         Humidity = 99.0f,
     };
-    // These timestamps are before the max seen timestamp for sensor 1
-    long lateTs = baseTs + (5 * 60) + (i * 60); // minutes 5, 6, 7
+    // These primary indexes are before the max seen for sensor 1
+    long latePi = basePi + (5 * 60) + (i * 60); // minutes 5, 6, 7
     ReadOnlySpan<byte> latePayload = MemoryMarshal.AsBytes(new ReadOnlySpan<SensorReading>(in lateReading));
-    db.Append(secondaryIndex: 1, payload: latePayload, timestamp: lateTs, version: 1);
+    db.Append(primaryIndex: latePi, secondaryIndex: 1, version: 1, payload: latePayload);
 }
 Console.WriteLine("Late arrivals written.\n");
 
 // ── Read a time range for one secondary index ──────────────────────────────────
-// Query by primary index (timestamp range) filtered to a single secondary index.
+// Query by primary index range filtered to a single secondary index.
 // This range includes both normal entries AND the late arrivals we just wrote.
 
-long queryStart = baseTs + (5 * 60); // start from minute 5 (where late arrivals begin)
-long queryEnd = baseTs + (20 * 60);   // through minute 20
+long queryStartPi = basePi + (5 * 60); // start from minute 5 (where late arrivals begin)
+long queryEndPi = basePi + (20 * 60);   // through minute 20
 
 Console.WriteLine($"── Single-index read (sensor 1, minutes 5–20) ──");
-Console.WriteLine($"(includes 3 late arrivals merged in timestamp order)");
-List<StreamEntry> entries = db.ReadRange(secondaryIndex: 1, startTs: queryStart, endTs: queryEnd);
+Console.WriteLine($"(includes 3 late arrivals merged in primary index order)");
+List<StreamEntry> entries = db.ReadRange(secondaryIndex: 1, startPrimaryIndex: queryStartPi, endPrimaryIndex: queryEndPi);
 Console.WriteLine($"Got {entries.Count} entries:");
 foreach (StreamEntry e in entries)
 {
     SensorReading r = registry.Deserialize<SensorReading>(e);
-    Console.WriteLine($"  ts={e.Timestamp} (primary)  sensor={e.SecondaryIndex} (secondary)  temp={r.Temperature:F1}°C  humidity={r.Humidity:F1}%");
+    Console.WriteLine($"  pi={e.PrimaryIndex} (primary)  sensor={e.SecondaryIndex} (secondary)  temp={r.Temperature:F1}°C  humidity={r.Humidity:F1}%");
 }
 Console.WriteLine();
 
@@ -123,8 +124,8 @@ Console.WriteLine();
 Console.WriteLine($"── Multi-index read (sensors 1-3, same window) ──");
 Dictionary<int, List<StreamEntry>> multi = db.ReadRange(
     secondaryIndexes: new[] { 1, 2, 3 },
-    startTs: queryStart,
-    endTs: queryEnd
+    startPrimaryIndex: queryStartPi,
+    endPrimaryIndex: queryEndPi
 );
 foreach ((int secondaryIndex, List<StreamEntry> sensorEntries) in multi)
 {

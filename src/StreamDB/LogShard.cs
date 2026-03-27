@@ -28,16 +28,16 @@ namespace StreamDB
 
         /// <summary>
         /// Write a record with header + payload to the log.
-        /// Header: [8B timestamp][4B secondaryIndex][2B version][2B payloadLength]
+        /// Header: [8B primary_index][4B secondaryIndex][2B version][2B payloadLength]
         /// </summary>
-        public long Enqueue(int secondaryIndex, ReadOnlySpan<byte> payload, long timestamp, ushort version)
+        public long Enqueue(int secondaryIndex, ReadOnlySpan<byte> payload, long primaryIndex, ushort version)
         {
             int totalSize = StreamHeader.Size + payload.Length;
             Span<byte> buffer = totalSize <= 256
                 ? stackalloc byte[totalSize]
                 : new byte[totalSize];
 
-            StreamHeader.Write(buffer, timestamp, secondaryIndex, version, (ushort)payload.Length);
+            StreamHeader.Write(buffer, primaryIndex, secondaryIndex, version, (ushort)payload.Length);
             payload.CopyTo(buffer[StreamHeader.Size..]);
 
             return _log.Enqueue(buffer);
@@ -46,18 +46,18 @@ namespace StreamDB
         /// <summary>
         /// Single-index scan. Delegates to the multi-index overload.
         /// </summary>
-        public List<StreamEntry> ScanRange(int secondaryIndex, long fromAddress, long startTs, long endTs, int limit = 0)
+        public List<StreamEntry> ScanRange(int secondaryIndex, long fromAddress, long startPrimaryIndex, long endPrimaryIndex, int limit = 0)
         {
-            Dictionary<int, List<StreamEntry>> results = ScanRange(new HashSet<int>(1) { secondaryIndex }, fromAddress, startTs, endTs, limit);
+            Dictionary<int, List<StreamEntry>> results = ScanRange(new HashSet<int>(1) { secondaryIndex }, fromAddress, startPrimaryIndex, endPrimaryIndex, limit);
             return results[secondaryIndex];
         }
 
         /// <summary>
         /// Scan the shard once from <paramref name="fromAddress"/> and collect entries for all
-        /// secondary indexes in <paramref name="indexes"/> whose timestamps fall within [startTs, endTs].
-        /// Timestamps are read from the header (primary index), secondary indexes from the header.
+        /// secondary indexes in <paramref name="indexes"/> whose primary indexes fall within [startPrimaryIndex, endPrimaryIndex].
+        /// Primary indexes are read from the header, secondary indexes from the header.
         /// </summary>
-        public Dictionary<int, List<StreamEntry>> ScanRange(HashSet<int> indexes, long fromAddress, long startTs, long endTs, int limit = 0)
+        public Dictionary<int, List<StreamEntry>> ScanRange(HashSet<int> indexes, long fromAddress, long startPrimaryIndex, long endPrimaryIndex, int limit = 0)
         {
             Dictionary<int, List<StreamEntry>> results = new Dictionary<int, List<StreamEntry>>(indexes.Count);
             foreach (int id in indexes)
@@ -83,9 +83,9 @@ namespace StreamDB
                 if (!indexes.Contains(entryIdx) || finished.Contains(entryIdx))
                     continue;
 
-                long ts = StreamHeader.ReadTimestamp(entry.AsSpan());
+                long pi = StreamHeader.ReadPrimaryIndex(entry.AsSpan());
 
-                if (ts > endTs)
+                if (pi > endPrimaryIndex)
                 {
                     finished.Add(entryIdx);
                     if (finished.Count == indexes.Count)
@@ -93,14 +93,14 @@ namespace StreamDB
                     continue;
                 }
 
-                if (ts >= startTs)
+                if (pi >= startPrimaryIndex)
                 {
                     ushort version = StreamHeader.ReadVersion(entry.AsSpan());
                     ushort payloadLen = StreamHeader.ReadPayloadLength(entry.AsSpan());
                     byte[] payload = new byte[payloadLen];
                     entry.AsSpan(StreamHeader.Size, payloadLen).CopyTo(payload);
 
-                    results[entryIdx].Add(new StreamEntry(ts, entryIdx, version, payload));
+                    results[entryIdx].Add(new StreamEntry(pi, entryIdx, version, payload));
 
                     if (hasLimit && results[entryIdx].Count >= limit)
                     {
@@ -116,9 +116,9 @@ namespace StreamDB
 
         /// <summary>
         /// Scan the shard from <paramref name="fromAddress"/> and collect entries for all secondary indexes
-        /// whose timestamps fall within [startTs, endTs]. Lazily creates result lists.
+        /// whose primary indexes fall within [startPrimaryIndex, endPrimaryIndex]. Lazily creates result lists.
         /// </summary>
-        public Dictionary<int, List<StreamEntry>> ScanRangeAll(long fromAddress, long startTs, long endTs, int limit = 0)
+        public Dictionary<int, List<StreamEntry>> ScanRangeAll(long fromAddress, long startPrimaryIndex, long endPrimaryIndex, int limit = 0)
         {
             Dictionary<int, List<StreamEntry>> results = new Dictionary<int, List<StreamEntry>>();
             long beginAddr = Math.Max(fromAddress, _log.BeginAddress);
@@ -140,15 +140,15 @@ namespace StreamDB
                 if (finished.Contains(entryIdx))
                     continue;
 
-                long ts = StreamHeader.ReadTimestamp(entry.AsSpan());
+                long pi = StreamHeader.ReadPrimaryIndex(entry.AsSpan());
 
-                if (ts > endTs)
+                if (pi > endPrimaryIndex)
                 {
                     finished.Add(entryIdx);
                     continue;
                 }
 
-                if (ts >= startTs)
+                if (pi >= startPrimaryIndex)
                 {
                     if (!results.ContainsKey(entryIdx))
                         results[entryIdx] = new List<StreamEntry>();
@@ -158,7 +158,7 @@ namespace StreamDB
                     byte[] payload = new byte[payloadLen];
                     entry.AsSpan(StreamHeader.Size, payloadLen).CopyTo(payload);
 
-                    results[entryIdx].Add(new StreamEntry(ts, entryIdx, version, payload));
+                    results[entryIdx].Add(new StreamEntry(pi, entryIdx, version, payload));
 
                     if (hasLimit && results[entryIdx].Count >= limit)
                     {
@@ -172,9 +172,9 @@ namespace StreamDB
 
         /// <summary>
         /// Scan the shard and find the first entry for any index in <paramref name="indexes"/>
-        /// whose timestamp is ≥ <paramref name="fromTs"/>. Returns null if none found.
+        /// whose primary index is ≥ <paramref name="fromPrimaryIndex"/>. Returns null if none found.
         /// </summary>
-        public long? FindFirstTimestamp(HashSet<int> indexes, long fromAddress, long fromTs)
+        public long? FindFirstPrimaryIndex(HashSet<int> indexes, long fromAddress, long fromPrimaryIndex)
         {
             long beginAddr = Math.Max(fromAddress, _log.BeginAddress);
             long tailAddr = _log.SafeTailAddress;
@@ -192,9 +192,9 @@ namespace StreamDB
                 if (!indexes.Contains(entryIdx))
                     continue;
 
-                long ts = StreamHeader.ReadTimestamp(entry.AsSpan());
-                if (ts >= fromTs)
-                    return ts;
+                long pi = StreamHeader.ReadPrimaryIndex(entry.AsSpan());
+                if (pi >= fromPrimaryIndex)
+                    return pi;
             }
 
             return null;

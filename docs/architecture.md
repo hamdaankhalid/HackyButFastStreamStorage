@@ -19,7 +19,7 @@ StreamDB is a specialized storage engine designed for high-throughput stream ing
 ┌─────────────┐
 │   Clients   │  (ASP.NET request threads)
 └──────┬──────┘
-       │ Append(secondaryIndex, payload, timestamp)
+       │ Append(secondaryIndex, payload, primaryIndex)
        ▼
 ┌─────────────────────────────────────────────────────────┐
 │                      StreamDB                           │
@@ -61,12 +61,12 @@ Each record stored in FasterLog has a 16-byte header followed by a variable-leng
 ```
 ┌──────────────┬────────────────┬──────────────┬─────────────────┬──────────────────┐
 │ 8B: long     │ 4B: int        │ 2B: ushort   │ 2B: ushort      │ N bytes: payload │
-│ timestamp    │ secondary_idx  │ version      │ payload length  │ (opaque bytes)   │
+│ primary_idx  │ secondary_idx  │ version      │ payload length  │ (opaque bytes)   │
 │ PRIMARY IDX  │ SECONDARY IDX  │              │                 │                  │
 └──────────────┴────────────────┴──────────────┴─────────────────┴──────────────────┘
 ```
 
-- **Timestamp** (primary index): Used for range queries and ordering
+- **Primary Index**: Used for range queries and ordering (e.g. timestamp, sequence number)
 - **Secondary Index**: Used for sharding and filtering (e.g., device ID, sensor ID, user ID)
 - **Version**: Schema version for payload format evolution
 - **Payload**: Opaque bytes — StreamDB never interprets these
@@ -92,18 +92,18 @@ var payload = new GpsPayload { Lat = 37.77, Long = -122.42, Accuracy = 5.0f, Spe
 
 // Append with header fields + raw payload bytes
 streamDb.Append(
+    primaryIndex: DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
     secondaryIndex: sensorId,
-    payload: MemoryMarshal.AsBytes(new ReadOnlySpan<GpsPayload>(in payload)),
-    timestamp: DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-    version: StreamVersions.GpsV1
+    version: StreamVersions.GpsV1,
+    payload: MemoryMarshal.AsBytes(new ReadOnlySpan<GpsPayload>(in payload))
 );
 ```
 
 **Constraints:**
 - Writes are serialized per secondary index (upstream responsibility)
-- Monotonically increasing timestamps are optimal but **not required** — out-of-order
-  (late-arriving) writes are automatically routed to a SQLite side store and merged
-  into reads transparently
+- Primary index should ideally be monotonically increasing per secondary index for optimal performance
+- Out-of-order (non-monotonic) primary index values are handled transparently via the late arrivals side store
+- The late arrivals path incurs a synchronous SQLite write, so it's designed for occasional out-of-order data, not as the primary write path
 
 ### Reading Data
 
@@ -111,8 +111,8 @@ streamDb.Append(
 ```csharp
 List<StreamEntry> data = streamDb.ReadRange(
     secondaryIndex: sensorId,
-    startTs: startTime,
-    endTs: endTime,
+    startPrimaryIndex: startTime,
+    endPrimaryIndex: endTime,
     limit: 1000  // 0 = unlimited
 );
 
@@ -120,7 +120,7 @@ List<StreamEntry> data = streamDb.ReadRange(
 foreach (var entry in data)
 {
     var gps = MemoryMarshal.Read<GpsPayload>(entry.Payload);
-    Console.WriteLine($"SecondaryIndex {entry.SecondaryIndex} at {entry.Timestamp}: ({gps.Lat}, {gps.Long})");
+    Console.WriteLine($"SecondaryIndex {entry.SecondaryIndex} at {entry.PrimaryIndex}: ({gps.Lat}, {gps.Long})");
 }
 ```
 
@@ -128,8 +128,8 @@ foreach (var entry in data)
 ```csharp
 Dictionary<int, List<StreamEntry>> data = streamDb.ReadRange(
     secondaryIndexes: new[] { 1234, 5678, 9012 },
-    startTs: startTime,
-    endTs: endTime,
+    startPrimaryIndex: startTime,
+    endPrimaryIndex: endTime,
     limit: 1000
 );
 ```
@@ -137,8 +137,8 @@ Dictionary<int, List<StreamEntry>> data = streamDb.ReadRange(
 **All secondary indexes:**
 ```csharp
 Dictionary<int, List<StreamEntry>> data = streamDb.ReadRange(
-    startTs: startTime,
-    endTs: endTime,
+    startPrimaryIndex: startTime,
+    endPrimaryIndex: endTime,
     limit: 1000
 );
 ```
@@ -186,15 +186,15 @@ Console.WriteLine($"Queue Depth: {stats.PendingIdxQueueLen}");
 
 ### Late Arrivals (Out-of-Order Writes)
 
-StreamDB is optimized for monotonically increasing timestamps, but handles occasional
+StreamDB is optimized for monotonically increasing primary indexes, but handles occasional
 out-of-order writes transparently via a **late arrivals side store**:
 
 ```
-Normal write (ts ≥ maxTs):  → FasterLog (lock-free, fast)
-Late arrival (ts < maxTs):  → SQLite late_arrivals table (synchronous, correct)
+Normal write (pi ≥ maxPi):  → FasterLog (lock-free, fast)
+Late arrival (pi < maxPi):  → SQLite late_arrivals table (synchronous, correct)
 ```
 
-- On `Append`: tracks `maxTimestamp` per secondary index. If the incoming timestamp is
+- On `Append`: tracks `maxPrimaryIndex` per secondary index. If the incoming primary index is
   lower than the max seen, the entry is stored in a `late_arrivals` SQLite table instead of FasterLog.
 - On `ReadRange`: merges FasterLog scan results with a `late_arrivals` query, producing
   a correctly-ordered result transparently.
@@ -210,21 +210,21 @@ SQLite write, which is acceptable for infrequent out-of-order data.
 ```sql
 SELECT log_address 
 FROM stream_index 
-WHERE secondary_index = ? AND timestamp <= ?
-ORDER BY timestamp DESC 
+WHERE secondary_index = ? AND primary_index <= ?
+ORDER BY primary_index DESC 
 LIMIT 1
 ```
-Returns the nearest indexed address ≤ startTs (or 0 if none exists).
+Returns the nearest indexed address ≤ startPrimaryIndex (or 0 if none exists).
 
 ### 2. FasterLog Scan
 - **Start from indexed address**: Bounded scan distance
 - **Filter by secondary index**: Fast path without full deserialization
-- **Filter by timestamp**: [startTs, endTs]
-- **Stop early**: When timestamp > endTs (safe for monotonic data)
+- **Filter by primary index**: [startPrimaryIndex, endPrimaryIndex]
+- **Stop early**: When primary index > endPrimaryIndex (safe for monotonic data)
 
 ### 3. Late Arrivals Merge
 - Query the `late_arrivals` SQLite table for the same secondary index(es) and time range
-- Merge results with the FasterLog scan results, sorted by timestamp
+- Merge results with the FasterLog scan results, sorted by primary index
 - Transparent to the caller — `ReadRange` always returns the complete, correctly-ordered result
 
 ### Multi-Index Optimization
@@ -257,7 +257,7 @@ Returns the nearest indexed address ≤ startTs (or 0 if none exists).
 **Purpose:** Remove old data based on retention policy
 
 ```
-1. DELETE FROM stream_index WHERE timestamp < cutoffTs
+1. DELETE FROM stream_index WHERE primary_index < cutoffPi
 2. For each shard:
    - Find MIN(log_address) still referenced
    - TruncateUntil(minAddr) on FasterLog
@@ -286,7 +286,7 @@ Returns the nearest indexed address ≤ startTs (or 0 if none exists).
 
 ### Guarantees
 
-✅ **Per-index monotonicity**: Timestamps strictly increase per secondary index in FasterLog; out-of-order writes go to side store  
+✅ **Per-index monotonicity**: Primary indexes strictly increase per secondary index in FasterLog; out-of-order writes go to side store  
 ✅ **Non-blocking writes**: FasterLog append never waits  
 ✅ **Durability before indexing**: Log committed before SQLite insert  
 ✅ **No deadlocks**: Lock hierarchy enforced  
@@ -329,7 +329,7 @@ For each shard:
 
 ### Storage
 - **FasterLog**: Append-only, 4KB page size
-- **SQLite**: WITHOUT ROWID, primary key (secondary_index, timestamp); plus `late_arrivals` table for out-of-order entries
+- **SQLite**: WITHOUT ROWID, primary key (secondary_index, primary_index); plus `late_arrivals` table for out-of-order entries
 - **Index density**: 1 entry per 16-4096 writes (adaptive)
 
 ### Memory
@@ -370,7 +370,7 @@ QueueLowWaterMark = 512;    // 25% - trigger scale down
 ## Best Practices
 
 ### ✅ Do
-- Maintain per-secondary-index monotonic timestamps when possible (optimal performance)
+- Maintain per-secondary-index monotonic primary indexes when possible (optimal performance)
 - Serialize writes per secondary index (upstream)
 - Monitor `GetStats()` for health
 - Use multi-index overload for batch queries

@@ -7,7 +7,7 @@ namespace StreamDB
     /// the FasterLog scan's early termination optimization.
     ///
     /// Normal (monotonic) writes go to FasterLog for maximum throughput. When a write
-    /// arrives with a timestamp lower than the max seen for that secondary index,
+    /// arrives with a primary index lower than the max seen for that secondary index,
     /// it is stored here instead. Reads merge both sources transparently.
     ///
     /// Uses a SQLite table in the same database as the sparse index.
@@ -30,63 +30,63 @@ namespace StreamDB
                 """
                 CREATE TABLE IF NOT EXISTS late_arrivals (
                     secondary_index INTEGER NOT NULL,
-                    timestamp INTEGER NOT NULL,
+                    primary_index INTEGER NOT NULL,
                     version INTEGER NOT NULL,
                     payload BLOB NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_late_arrivals_lookup
-                    ON late_arrivals (secondary_index, timestamp);
+                    ON late_arrivals (secondary_index, primary_index);
                 """;
             cmd.ExecuteNonQuery();
         }
 
         /// <summary>
         /// Store a late-arriving entry. Called on the write path when an out-of-order
-        /// timestamp is detected. This is a synchronous SQLite write, acceptable because
+        /// primary index is detected. This is a synchronous SQLite write, acceptable because
         /// late arrivals are infrequent.
         /// </summary>
-        public void Insert(int secondaryIndex, long timestamp, ushort version, ReadOnlySpan<byte> payload)
+        public void Insert(int secondaryIndex, long primaryIndex, ushort version, ReadOnlySpan<byte> payload)
         {
             using PooledConnection pooled = _getConnection();
             using SqliteCommand cmd = pooled.Connection.CreateCommand();
-            cmd.CommandText = "INSERT INTO late_arrivals (secondary_index, timestamp, version, payload) VALUES ($sidx, $ts, $ver, $payload)";
+            cmd.CommandText = "INSERT INTO late_arrivals (secondary_index, primary_index, version, payload) VALUES ($sidx, $pi, $ver, $payload)";
             cmd.Parameters.AddWithValue("$sidx", secondaryIndex);
-            cmd.Parameters.AddWithValue("$ts", timestamp);
+            cmd.Parameters.AddWithValue("$pi", primaryIndex);
             cmd.Parameters.AddWithValue("$ver", (int)version);
             cmd.Parameters.AddWithValue("$payload", payload.ToArray());
             cmd.ExecuteNonQuery();
         }
 
         /// <summary>
-        /// Query late arrivals for a single secondary index within [startTs, endTs], ordered by timestamp.
+        /// Query late arrivals for a single secondary index within [startPrimaryIndex, endPrimaryIndex], ordered by primary index.
         /// </summary>
-        public List<StreamEntry> QueryRange(int secondaryIndex, long startTs, long endTs, int limit = 0)
+        public List<StreamEntry> QueryRange(int secondaryIndex, long startPrimaryIndex, long endPrimaryIndex, int limit = 0)
         {
             using PooledConnection pooled = _getConnection();
             using SqliteCommand cmd = pooled.Connection.CreateCommand();
 
-            string sql = "SELECT timestamp, secondary_index, version, payload FROM late_arrivals WHERE secondary_index = $sidx AND timestamp >= $start AND timestamp <= $end ORDER BY timestamp";
+            string sql = "SELECT primary_index, secondary_index, version, payload FROM late_arrivals WHERE secondary_index = $sidx AND primary_index >= $start AND primary_index <= $end ORDER BY primary_index";
             if (limit > 0) sql += " LIMIT $limit";
 
             cmd.CommandText = sql;
             cmd.Parameters.AddWithValue("$sidx", secondaryIndex);
-            cmd.Parameters.AddWithValue("$start", startTs);
-            cmd.Parameters.AddWithValue("$end", endTs);
+            cmd.Parameters.AddWithValue("$start", startPrimaryIndex);
+            cmd.Parameters.AddWithValue("$end", endPrimaryIndex);
             if (limit > 0) cmd.Parameters.AddWithValue("$limit", limit);
 
             return ReadEntries(cmd);
         }
 
         /// <summary>
-        /// Query late arrivals for multiple secondary indexes within [startTs, endTs].
+        /// Query late arrivals for multiple secondary indexes within [startPrimaryIndex, endPrimaryIndex].
         /// Returns a dictionary keyed by secondary index.
         /// </summary>
-        public Dictionary<int, List<StreamEntry>> QueryRange(IEnumerable<int> secondaryIndexes, long startTs, long endTs, int limit = 0)
+        public Dictionary<int, List<StreamEntry>> QueryRange(IEnumerable<int> secondaryIndexes, long startPrimaryIndex, long endPrimaryIndex, int limit = 0)
         {
             var result = new Dictionary<int, List<StreamEntry>>();
             foreach (int idx in secondaryIndexes)
             {
-                List<StreamEntry> entries = QueryRange(idx, startTs, endTs, limit);
+                List<StreamEntry> entries = QueryRange(idx, startPrimaryIndex, endPrimaryIndex, limit);
                 if (entries.Count > 0)
                     result[idx] = entries;
             }
@@ -94,16 +94,16 @@ namespace StreamDB
         }
 
         /// <summary>
-        /// Query late arrivals for all secondary indexes within [startTs, endTs].
+        /// Query late arrivals for all secondary indexes within [startPrimaryIndex, endPrimaryIndex].
         /// Returns a dictionary keyed by secondary index.
         /// </summary>
-        public Dictionary<int, List<StreamEntry>> QueryRangeAll(long startTs, long endTs, int limit = 0)
+        public Dictionary<int, List<StreamEntry>> QueryRangeAll(long startPrimaryIndex, long endPrimaryIndex, int limit = 0)
         {
             using PooledConnection pooled = _getConnection();
             using SqliteCommand cmd = pooled.Connection.CreateCommand();
-            cmd.CommandText = "SELECT timestamp, secondary_index, version, payload FROM late_arrivals WHERE timestamp >= $start AND timestamp <= $end ORDER BY secondary_index, timestamp";
-            cmd.Parameters.AddWithValue("$start", startTs);
-            cmd.Parameters.AddWithValue("$end", endTs);
+            cmd.CommandText = "SELECT primary_index, secondary_index, version, payload FROM late_arrivals WHERE primary_index >= $start AND primary_index <= $end ORDER BY secondary_index, primary_index";
+            cmd.Parameters.AddWithValue("$start", startPrimaryIndex);
+            cmd.Parameters.AddWithValue("$end", endPrimaryIndex);
 
             var result = new Dictionary<int, List<StreamEntry>>();
             using SqliteDataReader reader = cmd.ExecuteReader();
@@ -131,10 +131,10 @@ namespace StreamDB
         }
 
         /// <summary>
-        /// Returns the minimum timestamp ≥ <paramref name="fromTs"/> across the specified
+        /// Returns the minimum primary index ≥ <paramref name="fromPrimaryIndex"/> across the specified
         /// secondary indexes. Returns null if no matching late arrival exists.
         /// </summary>
-        public long? GetEarliestTimestamp(IEnumerable<int> secondaryIndexes, long fromTs)
+        public long? GetEarliestPrimaryIndex(IEnumerable<int> secondaryIndexes, long fromPrimaryIndex)
         {
             List<int> indexList = secondaryIndexes.ToList();
             if (indexList.Count == 0) return null;
@@ -150,11 +150,11 @@ namespace StreamDB
                 cmd.Parameters.AddWithValue(paramName, indexList[i]);
             }
 
-            cmd.CommandText = $"SELECT MIN(timestamp) FROM late_arrivals WHERE secondary_index IN ({string.Join(",", inParams)}) AND timestamp >= $fromTs";
-            cmd.Parameters.AddWithValue("$fromTs", fromTs);
+            cmd.CommandText = $"SELECT MIN(primary_index) FROM late_arrivals WHERE secondary_index IN ({string.Join(",", inParams)}) AND primary_index >= $fromPi";
+            cmd.Parameters.AddWithValue("$fromPi", fromPrimaryIndex);
 
             object? result = cmd.ExecuteScalar();
-            return result is long ts ? ts : null;
+            return result is long pi ? pi : null;
         }
 
         /// <summary>
@@ -166,13 +166,13 @@ namespace StreamDB
             using SqliteCommand cmd = pooled.Connection.CreateCommand();
             cmd.CommandText =
                 """
-                SELECT la.secondary_index, la.timestamp, la.version, la.payload
+                SELECT la.secondary_index, la.primary_index, la.version, la.payload
                 FROM late_arrivals la
                 INNER JOIN (
-                    SELECT secondary_index, MAX(timestamp) as max_ts
+                    SELECT secondary_index, MAX(primary_index) as max_pi
                     FROM late_arrivals
                     GROUP BY secondary_index
-                ) latest ON la.secondary_index = latest.secondary_index AND la.timestamp = latest.max_ts
+                ) latest ON la.secondary_index = latest.secondary_index AND la.primary_index = latest.max_pi
                 """;
 
             var result = new Dictionary<int, StreamEntry>();
@@ -191,15 +191,15 @@ namespace StreamDB
         }
 
         /// <summary>
-        /// Delete late arrivals older than <paramref name="cutoffTs"/>.
+        /// Delete late arrivals older than <paramref name="cutoffPi"/>.
         /// Called during retention to keep the side store bounded.
         /// </summary>
-        public void PurgeBefore(long cutoffTs)
+        public void PurgeBefore(long cutoffPi)
         {
             using PooledConnection pooled = _getConnection();
             using SqliteCommand cmd = pooled.Connection.CreateCommand();
-            cmd.CommandText = "DELETE FROM late_arrivals WHERE timestamp < $cutoff";
-            cmd.Parameters.AddWithValue("$cutoff", cutoffTs);
+            cmd.CommandText = "DELETE FROM late_arrivals WHERE primary_index < $cutoff";
+            cmd.Parameters.AddWithValue("$cutoff", cutoffPi);
             cmd.ExecuteNonQuery();
         }
 

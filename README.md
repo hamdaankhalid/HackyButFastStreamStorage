@@ -12,10 +12,10 @@ Every record in StreamDB is organized around two index concepts:
 
 | Concept | Type | Purpose |
 |---------|------|---------|
-| **Primary Index** | `long` (timestamp) | Time-range queries and ordering. Every record carries a timestamp as its primary index. |
+| **Primary Index** | `long` (monotonic key) | Range queries and ordering. Every record carries a primary index — commonly a Unix timestamp, but can be any monotonically increasing value (sequence number, score, etc.). |
 | **Secondary Index** | `int` (grouping key) | Sharding and filtering. Represents any logical grouping — device ID, sensor ID, user ID, region, etc. |
 
-The primary index (timestamp) determines **when** something happened. The secondary index determines **who/what** produced it. Together they enable efficient queries like "give me all readings from sensor 42 between 1pm and 2pm."
+The primary index determines **when** (or **where in sequence**) something happened. The secondary index determines **who/what** produced it. Together they enable efficient queries like "give me all readings from sensor 42 between primary index 1000 and 2000."
 
 ### Key Properties
 
@@ -25,6 +25,9 @@ The primary index (timestamp) determines **when** something happened. The second
 - **Sharded storage** — distributes data across multiple FasterLog instances to reduce contention
 - **Automatic retention** — configurable data lifecycle with background cleanup
 - **Crash recovery** — reconciles the sparse index against durable log state on startup
+
+> **Note:** For best performance the primary index should be monotonically increasing per secondary index.
+> Out-of-order writes are handled transparently but incur a small performance penalty (synchronous SQLite write).
 
 ## Quick Start
 
@@ -38,15 +41,15 @@ var db = new StreamDB.StreamDB(
     logger: logger
 );
 
-// Write — timestamp is the primary index, secondaryIndex is the grouping key
-db.Append(secondaryIndex: sensorId, payload: bytes, timestamp: ts, version: 1);
+// Write — primaryIndex is the primary index, secondaryIndex is the grouping key
+db.Append(primaryIndex: pi, secondaryIndex: sensorId, version: 1, payload: bytes);
 
-// Read a time range for one secondary index
-List<StreamEntry> entries = db.ReadRange(secondaryIndex: sensorId, startTs: startTs, endTs: endTs);
+// Read a range for one secondary index
+List<StreamEntry> entries = db.ReadRange(secondaryIndex: sensorId, startPrimaryIndex: from, endPrimaryIndex: to);
 
 // Read across multiple secondary indexes (single scan per shard)
 Dictionary<int, List<StreamEntry>> multi = db.ReadRange(
-    secondaryIndexes: new[] { sensor1, sensor2, sensor3 }, startTs: startTs, endTs: endTs
+    secondaryIndexes: new[] { sensor1, sensor2, sensor3 }, startPrimaryIndex: from, endPrimaryIndex: to
 );
 
 // Monitor health

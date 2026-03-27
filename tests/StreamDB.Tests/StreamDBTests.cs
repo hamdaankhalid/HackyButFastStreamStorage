@@ -30,18 +30,18 @@ public class StreamHeaderTests
 
         StreamHeader.Write(buffer, ts, secondaryIdx, version, payloadLen);
 
-        Assert.That(StreamHeader.ReadTimestamp(buffer), Is.EqualTo(ts));
+        Assert.That(StreamHeader.ReadPrimaryIndex(buffer), Is.EqualTo(ts));
         Assert.That(StreamHeader.ReadSecondaryIndex(buffer), Is.EqualTo(secondaryIdx));
         Assert.That(StreamHeader.ReadVersion(buffer), Is.EqualTo(version));
         Assert.That(StreamHeader.ReadPayloadLength(buffer), Is.EqualTo(payloadLen));
     }
 
     [Test]
-    public void WriteAndRead_NegativeTimestamp()
+    public void WriteAndRead_NegativePrimaryIndex()
     {
         Span<byte> buffer = stackalloc byte[StreamHeader.Size];
         StreamHeader.Write(buffer, -999L, 0, 1, 0);
-        Assert.That(StreamHeader.ReadTimestamp(buffer), Is.EqualTo(-999L));
+        Assert.That(StreamHeader.ReadPrimaryIndex(buffer), Is.EqualTo(-999L));
     }
 
     [Test]
@@ -50,7 +50,7 @@ public class StreamHeaderTests
         Span<byte> buffer = stackalloc byte[StreamHeader.Size];
         StreamHeader.Write(buffer, long.MaxValue, int.MaxValue, ushort.MaxValue, ushort.MaxValue);
 
-        Assert.That(StreamHeader.ReadTimestamp(buffer), Is.EqualTo(long.MaxValue));
+        Assert.That(StreamHeader.ReadPrimaryIndex(buffer), Is.EqualTo(long.MaxValue));
         Assert.That(StreamHeader.ReadSecondaryIndex(buffer), Is.EqualTo(int.MaxValue));
         Assert.That(StreamHeader.ReadVersion(buffer), Is.EqualTo(ushort.MaxValue));
         Assert.That(StreamHeader.ReadPayloadLength(buffer), Is.EqualTo(ushort.MaxValue));
@@ -138,11 +138,11 @@ public class StreamDBBasicTests
             Directory.Delete(_dataDir, recursive: true);
     }
 
-    private void AppendPayload(int secondaryIndex, long timestamp, float value = 1.0f, ushort version = 1)
+    private void AppendPayload(int secondaryIndex, long primaryIndex, float value = 1.0f, ushort version = 1)
     {
-        var payload = new TestPayload { Value = value, Counter = (int)timestamp };
+        var payload = new TestPayload { Value = value, Counter = (int)primaryIndex };
         ReadOnlySpan<byte> bytes = MemoryMarshal.AsBytes(new ReadOnlySpan<TestPayload>(in payload));
-        _db.Append(secondaryIndex: secondaryIndex, payload: bytes, timestamp: timestamp, version: version);
+        _db.Append(primaryIndex: primaryIndex, secondaryIndex: secondaryIndex, version: version, payload: bytes);
     }
 
     [Test]
@@ -152,11 +152,11 @@ public class StreamDBBasicTests
             AppendPayload(1, 100 + i);
 
         _db.WaitForPendingWrites();
-        var results = _db.ReadRange(secondaryIndex: 1, startTs: 100, endTs: 109);
+        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 109);
 
         Assert.That(results, Has.Count.EqualTo(10));
-        Assert.That(results[0].Timestamp, Is.EqualTo(100));
-        Assert.That(results[9].Timestamp, Is.EqualTo(109));
+        Assert.That(results[0].PrimaryIndex, Is.EqualTo(100));
+        Assert.That(results[9].PrimaryIndex, Is.EqualTo(109));
     }
 
     [Test]
@@ -165,7 +165,7 @@ public class StreamDBBasicTests
         AppendPayload(1, 100);
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(secondaryIndex: 1, startTs: 200, endTs: 300);
+        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 200, endPrimaryIndex: 300);
         Assert.That(results, Is.Empty);
     }
 
@@ -175,7 +175,7 @@ public class StreamDBBasicTests
         AppendPayload(1, 100);
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(secondaryIndex: 999, startTs: 0, endTs: 200);
+        var results = _db.ReadRange(secondaryIndex: 999, startPrimaryIndex: 0, endPrimaryIndex: 200);
         Assert.That(results, Is.Empty);
     }
 
@@ -186,15 +186,15 @@ public class StreamDBBasicTests
             AppendPayload(1, 100 + i);
 
         _db.WaitForPendingWrites();
-        var results = _db.ReadRange(secondaryIndex: 1, startTs: 100, endTs: 200, limit: 5);
+        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 200, limit: 5);
 
         Assert.That(results, Has.Count.EqualTo(5));
-        Assert.That(results[0].Timestamp, Is.EqualTo(100));
-        Assert.That(results[4].Timestamp, Is.EqualTo(104));
+        Assert.That(results[0].PrimaryIndex, Is.EqualTo(100));
+        Assert.That(results[4].PrimaryIndex, Is.EqualTo(104));
     }
 
     [Test]
-    public void ReadRange_BoundaryTimestamps_Inclusive()
+    public void ReadRange_BoundaryPrimaryIndexes_Inclusive()
     {
         AppendPayload(1, 100);
         AppendPayload(1, 200);
@@ -202,15 +202,15 @@ public class StreamDBBasicTests
         _db.WaitForPendingWrites();
 
         // Exact boundary match
-        var results = _db.ReadRange(secondaryIndex: 1, startTs: 100, endTs: 300);
+        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 300);
         Assert.That(results, Has.Count.EqualTo(3));
 
-        // Start at exact timestamp
-        results = _db.ReadRange(secondaryIndex: 1, startTs: 200, endTs: 300);
+        // Start at exact primary index
+        results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 200, endPrimaryIndex: 300);
         Assert.That(results, Has.Count.EqualTo(2));
 
-        // End at exact timestamp
-        results = _db.ReadRange(secondaryIndex: 1, startTs: 100, endTs: 200);
+        // End at exact primary index
+        results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 200);
         Assert.That(results, Has.Count.EqualTo(2));
     }
 
@@ -220,9 +220,9 @@ public class StreamDBBasicTests
         AppendPayload(1, 100);
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(secondaryIndex: 1, startTs: 100, endTs: 100);
+        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 100);
         Assert.That(results, Has.Count.EqualTo(1));
-        Assert.That(results[0].Timestamp, Is.EqualTo(100));
+        Assert.That(results[0].PrimaryIndex, Is.EqualTo(100));
     }
 
     [Test]
@@ -234,7 +234,7 @@ public class StreamDBBasicTests
         AppendPayload(1, 100, value: 42.5f);
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(secondaryIndex: 1, startTs: 100, endTs: 100);
+        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 100);
         Assert.That(results, Has.Count.EqualTo(1));
 
         TestPayload p = registry.Deserialize<TestPayload>(results[0]);
@@ -249,7 +249,7 @@ public class StreamDBBasicTests
         AppendPayload(1, 200, version: 2);
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(secondaryIndex: 1, startTs: 100, endTs: 200);
+        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 200);
         Assert.That(results, Has.Count.EqualTo(2));
         Assert.That(results[0].Version, Is.EqualTo(1));
         Assert.That(results[1].Version, Is.EqualTo(2));
@@ -277,11 +277,11 @@ public class StreamDBMultiIndexTests
             Directory.Delete(_dataDir, recursive: true);
     }
 
-    private void AppendPayload(int secondaryIndex, long timestamp, float value = 1.0f)
+    private void AppendPayload(int secondaryIndex, long primaryIndex, float value = 1.0f)
     {
-        var payload = new TestPayload { Value = value, Counter = (int)timestamp };
+        var payload = new TestPayload { Value = value, Counter = (int)primaryIndex };
         ReadOnlySpan<byte> bytes = MemoryMarshal.AsBytes(new ReadOnlySpan<TestPayload>(in payload));
-        _db.Append(secondaryIndex: secondaryIndex, payload: bytes, timestamp: timestamp, version: 1);
+        _db.Append(primaryIndex: primaryIndex, secondaryIndex: secondaryIndex, version: 1, payload: bytes);
     }
 
     [Test]
@@ -295,7 +295,7 @@ public class StreamDBMultiIndexTests
         }
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(secondaryIndexes: new[] { 1, 2, 3 }, startTs: 100, endTs: 104);
+        var results = _db.ReadRange(secondaryIndexes: new[] { 1, 2, 3 }, startPrimaryIndex: 100, endPrimaryIndex: 104);
         Assert.That(results.Keys, Has.Count.EqualTo(3));
         Assert.That(results[1], Has.Count.EqualTo(5));
         Assert.That(results[2], Has.Count.EqualTo(5));
@@ -310,7 +310,7 @@ public class StreamDBMultiIndexTests
         AppendPayload(2, 150);
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(secondaryIndexes: new[] { 1, 2 }, startTs: 100, endTs: 200);
+        var results = _db.ReadRange(secondaryIndexes: new[] { 1, 2 }, startPrimaryIndex: 100, endPrimaryIndex: 200);
         Assert.That(results[1], Has.Count.EqualTo(2));
         Assert.That(results[2], Has.Count.EqualTo(1));
     }
@@ -323,7 +323,7 @@ public class StreamDBMultiIndexTests
         AppendPayload(3, 100);
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(startTs: 0, endTs: 200);
+        var results = _db.ReadRange(startPrimaryIndex: 0, endPrimaryIndex: 200);
         Assert.That(results.Keys, Has.Count.EqualTo(3));
     }
 
@@ -334,7 +334,7 @@ public class StreamDBMultiIndexTests
             AppendPayload(1, 100 + i);
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(secondaryIndexes: new[] { 1 }, startTs: 100, endTs: 200, limit: 3);
+        var results = _db.ReadRange(secondaryIndexes: new[] { 1 }, startPrimaryIndex: 100, endPrimaryIndex: 200, limit: 3);
         Assert.That(results[1], Has.Count.EqualTo(3));
     }
 }
@@ -360,11 +360,11 @@ public class StreamDBLateArrivalsTests
             Directory.Delete(_dataDir, recursive: true);
     }
 
-    private void AppendPayload(int secondaryIndex, long timestamp, float value = 1.0f)
+    private void AppendPayload(int secondaryIndex, long primaryIndex, float value = 1.0f)
     {
-        var payload = new TestPayload { Value = value, Counter = (int)timestamp };
+        var payload = new TestPayload { Value = value, Counter = (int)primaryIndex };
         ReadOnlySpan<byte> bytes = MemoryMarshal.AsBytes(new ReadOnlySpan<TestPayload>(in payload));
-        _db.Append(secondaryIndex: secondaryIndex, payload: bytes, timestamp: timestamp, version: 1);
+        _db.Append(primaryIndex: primaryIndex, secondaryIndex: secondaryIndex, version: 1, payload: bytes);
     }
 
     [Test]
@@ -379,7 +379,7 @@ public class StreamDBLateArrivalsTests
     }
 
     [Test]
-    public void LateArrival_MergedInTimestampOrder()
+    public void LateArrival_MergedInPrimaryIndexOrder()
     {
         AppendPayload(1, 100);
         AppendPayload(1, 200);
@@ -387,21 +387,21 @@ public class StreamDBLateArrivalsTests
         AppendPayload(1, 150); // late arrival
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(secondaryIndex: 1, startTs: 100, endTs: 300);
+        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 300);
         Assert.That(results, Has.Count.EqualTo(4));
 
-        // Verify timestamp ordering
+        // Verify primary index ordering
         for (int i = 1; i < results.Count; i++)
         {
-            Assert.That(results[i].Timestamp, Is.GreaterThanOrEqualTo(results[i - 1].Timestamp),
-                $"Entry {i} (ts={results[i].Timestamp}) should be >= entry {i - 1} (ts={results[i - 1].Timestamp})");
+            Assert.That(results[i].PrimaryIndex, Is.GreaterThanOrEqualTo(results[i - 1].PrimaryIndex),
+                $"Entry {i} (pi={results[i].PrimaryIndex}) should be >= entry {i - 1} (pi={results[i - 1].PrimaryIndex})");
         }
 
         // Verify the late arrival is at the correct position
-        Assert.That(results[0].Timestamp, Is.EqualTo(100));
-        Assert.That(results[1].Timestamp, Is.EqualTo(150));
-        Assert.That(results[2].Timestamp, Is.EqualTo(200));
-        Assert.That(results[3].Timestamp, Is.EqualTo(300));
+        Assert.That(results[0].PrimaryIndex, Is.EqualTo(100));
+        Assert.That(results[1].PrimaryIndex, Is.EqualTo(150));
+        Assert.That(results[2].PrimaryIndex, Is.EqualTo(200));
+        Assert.That(results[3].PrimaryIndex, Is.EqualTo(300));
     }
 
     [Test]
@@ -420,12 +420,12 @@ public class StreamDBLateArrivalsTests
         var stats = _db.GetStats();
         Assert.That(stats.LateArrivals, Is.EqualTo(3));
 
-        var results = _db.ReadRange(secondaryIndex: 1, startTs: 100, endTs: 200);
+        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 200);
         Assert.That(results, Has.Count.EqualTo(13));
 
         // Verify ordering
         for (int i = 1; i < results.Count; i++)
-            Assert.That(results[i].Timestamp, Is.GreaterThanOrEqualTo(results[i - 1].Timestamp));
+            Assert.That(results[i].PrimaryIndex, Is.GreaterThanOrEqualTo(results[i - 1].PrimaryIndex));
     }
 
     [Test]
@@ -436,10 +436,10 @@ public class StreamDBLateArrivalsTests
         AppendPayload(1, 200); // late arrival
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(secondaryIndex: 1, startTs: 100, endTs: 300, limit: 2);
+        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 300, limit: 2);
         Assert.That(results, Has.Count.EqualTo(2));
-        Assert.That(results[0].Timestamp, Is.EqualTo(100));
-        Assert.That(results[1].Timestamp, Is.EqualTo(200)); // late arrival comes before 300
+        Assert.That(results[0].PrimaryIndex, Is.EqualTo(100));
+        Assert.That(results[1].PrimaryIndex, Is.EqualTo(200)); // late arrival comes before 300
     }
 
     [Test]
@@ -465,10 +465,10 @@ public class StreamDBLateArrivalsTests
         AppendPayload(1, 200);
         AppendPayload(1, 100, value: 99.9f); // late arrival with distinctive value
 
-        var results = _db.ReadRange(secondaryIndex: 1, startTs: 100, endTs: 200);
+        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 200);
         Assert.That(results, Has.Count.EqualTo(2));
 
-        // The late arrival should be first (ts=100)
+        // The late arrival should be first (pi=100)
         TestPayload p = registry.Deserialize<TestPayload>(results[0]);
         Assert.That(p.Value, Is.EqualTo(99.9f).Within(0.01f));
     }
@@ -486,13 +486,13 @@ public class StreamDBLateArrivalsTests
         AppendPayload(2, 200);
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(secondaryIndexes: new[] { 1, 2 }, startTs: 100, endTs: 300);
+        var results = _db.ReadRange(secondaryIndexes: new[] { 1, 2 }, startPrimaryIndex: 100, endPrimaryIndex: 300);
         Assert.That(results[1], Has.Count.EqualTo(3));
         Assert.That(results[2], Has.Count.EqualTo(3));
 
-        // Both should be in timestamp order
-        Assert.That(results[1][1].Timestamp, Is.EqualTo(200));
-        Assert.That(results[2][1].Timestamp, Is.EqualTo(200));
+        // Both should be in primary index order
+        Assert.That(results[1][1].PrimaryIndex, Is.EqualTo(200));
+        Assert.That(results[2][1].PrimaryIndex, Is.EqualTo(200));
     }
 
     [Test]
@@ -503,22 +503,22 @@ public class StreamDBLateArrivalsTests
         AppendPayload(1, 200); // late
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(startTs: 100, endTs: 300);
+        var results = _db.ReadRange(startPrimaryIndex: 100, endPrimaryIndex: 300);
         Assert.That(results[1], Has.Count.EqualTo(3));
-        Assert.That(results[1][1].Timestamp, Is.EqualTo(200));
+        Assert.That(results[1][1].PrimaryIndex, Is.EqualTo(200));
     }
 
     [Test]
-    public void LateArrival_SameTimestamp_BothKept()
+    public void LateArrival_SamePrimaryIndex_BothKept()
     {
         AppendPayload(1, 200);
-        AppendPayload(1, 100, value: 1.0f); // late with ts=100
+        AppendPayload(1, 100, value: 1.0f); // late with pi=100
 
-        // Write another normal entry at ts=100 — this simulates a duplicate timestamp
-        // Actually, since ts=100 < maxTs=200, this is also a late arrival
+        // Write another normal entry at pi=100 — this simulates a duplicate primary index
+        // Actually, since pi=100 < maxPi=200, this is also a late arrival
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(secondaryIndex: 1, startTs: 100, endTs: 200);
+        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 200);
         Assert.That(results, Has.Count.EqualTo(2));
     }
 }
@@ -544,11 +544,11 @@ public class StreamDBReadLatestTests
             Directory.Delete(_dataDir, recursive: true);
     }
 
-    private void AppendPayload(int secondaryIndex, long timestamp, float value = 1.0f)
+    private void AppendPayload(int secondaryIndex, long primaryIndex, float value = 1.0f)
     {
-        var payload = new TestPayload { Value = value, Counter = (int)timestamp };
+        var payload = new TestPayload { Value = value, Counter = (int)primaryIndex };
         ReadOnlySpan<byte> bytes = MemoryMarshal.AsBytes(new ReadOnlySpan<TestPayload>(in payload));
-        _db.Append(secondaryIndex: secondaryIndex, payload: bytes, timestamp: timestamp, version: 1);
+        _db.Append(primaryIndex: primaryIndex, secondaryIndex: secondaryIndex, version: 1, payload: bytes);
     }
 
     [Test]
@@ -564,27 +564,27 @@ public class StreamDBReadLatestTests
         var latest = _db.ReadLatest();
 
         Assert.That(latest, Has.Count.EqualTo(2));
-        Assert.That(latest[1].Timestamp, Is.EqualTo(1000 + 2047));
-        Assert.That(latest[2].Timestamp, Is.EqualTo(5000 + 2047));
+        Assert.That(latest[1].PrimaryIndex, Is.EqualTo(1000 + 2047));
+        Assert.That(latest[2].PrimaryIndex, Is.EqualTo(5000 + 2047));
     }
 
     [Test]
-    public void ReadLatest_WithLateArrival_KeepsHigherTimestamp()
+    public void ReadLatest_WithLateArrival_KeepsHigherPrimaryIndex()
     {
         for (int i = 0; i < 2048; i++)
             AppendPayload(1, 1000 + i);
         _db.WaitForPendingWrites();
 
-        // Late arrival with lower timestamp — shouldn't override the latest
+        // Late arrival with lower primary index — shouldn't override the latest
         AppendPayload(1, 1500);
 
         var latest = _db.ReadLatest();
-        Assert.That(latest[1].Timestamp, Is.EqualTo(1000 + 2047));
+        Assert.That(latest[1].PrimaryIndex, Is.EqualTo(1000 + 2047));
     }
 }
 
 [TestFixture]
-public class StreamDBGetEarliestTimestampTests
+public class StreamDBGetEarliestPrimaryIndexTests
 {
     private string _dataDir = null!;
     private StreamDB _db = null!;
@@ -604,52 +604,52 @@ public class StreamDBGetEarliestTimestampTests
             Directory.Delete(_dataDir, recursive: true);
     }
 
-    private void AppendPayload(int secondaryIndex, long timestamp)
+    private void AppendPayload(int secondaryIndex, long primaryIndex)
     {
         var payload = new TestPayload { Value = 1.0f, Counter = 0 };
         ReadOnlySpan<byte> bytes = MemoryMarshal.AsBytes(new ReadOnlySpan<TestPayload>(in payload));
-        _db.Append(secondaryIndex: secondaryIndex, payload: bytes, timestamp: timestamp, version: 1);
+        _db.Append(primaryIndex: primaryIndex, secondaryIndex: secondaryIndex, version: 1, payload: bytes);
     }
 
     [Test]
-    public void GetEarliestTimestamp_ReturnsEarliest()
+    public void GetEarliestPrimaryIndex_ReturnsEarliest()
     {
         AppendPayload(1, 200);
         AppendPayload(2, 100);
         AppendPayload(3, 300);
         _db.WaitForPendingWrites();
 
-        long? earliest = _db.GetEarliestTimestamp(new[] { 1, 2, 3 }, fromTs: 0);
+        long? earliest = _db.GetEarliestPrimaryIndex(new[] { 1, 2, 3 }, fromPrimaryIndex: 0);
         Assert.That(earliest, Is.EqualTo(100));
     }
 
     [Test]
-    public void GetEarliestTimestamp_RespectsFromTs()
+    public void GetEarliestPrimaryIndex_RespectsFromPrimaryIndex()
     {
         AppendPayload(1, 100);
         AppendPayload(1, 200);
         AppendPayload(1, 300);
         _db.WaitForPendingWrites();
 
-        long? earliest = _db.GetEarliestTimestamp(new[] { 1 }, fromTs: 150);
+        long? earliest = _db.GetEarliestPrimaryIndex(new[] { 1 }, fromPrimaryIndex: 150);
         Assert.That(earliest, Is.EqualTo(200));
     }
 
     [Test]
-    public void GetEarliestTimestamp_NoData_ReturnsNull()
+    public void GetEarliestPrimaryIndex_NoData_ReturnsNull()
     {
-        long? earliest = _db.GetEarliestTimestamp(new[] { 1 }, fromTs: 0);
+        long? earliest = _db.GetEarliestPrimaryIndex(new[] { 1 }, fromPrimaryIndex: 0);
         Assert.That(earliest, Is.Null);
     }
 
     [Test]
-    public void GetEarliestTimestamp_WithLateArrival()
+    public void GetEarliestPrimaryIndex_WithLateArrival()
     {
         AppendPayload(1, 300);
         AppendPayload(1, 100); // late arrival
         _db.WaitForPendingWrites();
 
-        long? earliest = _db.GetEarliestTimestamp(new[] { 1 }, fromTs: 0);
+        long? earliest = _db.GetEarliestPrimaryIndex(new[] { 1 }, fromPrimaryIndex: 0);
         Assert.That(earliest, Is.EqualTo(100));
     }
 }
@@ -675,17 +675,17 @@ public class StreamDBReadRangeFromAvailableTests
             Directory.Delete(_dataDir, recursive: true);
     }
 
-    private void AppendPayload(int secondaryIndex, long timestamp)
+    private void AppendPayload(int secondaryIndex, long primaryIndex)
     {
         var payload = new TestPayload { Value = 1.0f, Counter = 0 };
         ReadOnlySpan<byte> bytes = MemoryMarshal.AsBytes(new ReadOnlySpan<TestPayload>(in payload));
-        _db.Append(secondaryIndex: secondaryIndex, payload: bytes, timestamp: timestamp, version: 1);
+        _db.Append(primaryIndex: primaryIndex, secondaryIndex: secondaryIndex, version: 1, payload: bytes);
     }
 
     [Test]
     public void ReadRangeFromAvailable_NoData_ReturnsNegativeOne()
     {
-        var (rangeEnd, data) = _db.ReadRangeFromAvailable(new[] { 1 }, fromTs: 0, windowMs: 100);
+        var (rangeEnd, data) = _db.ReadRangeFromAvailable(new[] { 1 }, fromPrimaryIndex: 0, window: 100);
         Assert.That(rangeEnd, Is.EqualTo(-1));
         Assert.That(data, Is.Empty);
     }
@@ -697,13 +697,13 @@ public class StreamDBReadRangeFromAvailableTests
             AppendPayload(1, 100 + i * 10);
         _db.WaitForPendingWrites();
 
-        var (rangeEnd, data) = _db.ReadRangeFromAvailable(new[] { 1 }, fromTs: 100, windowMs: 50);
+        var (rangeEnd, data) = _db.ReadRangeFromAvailable(new[] { 1 }, fromPrimaryIndex: 100, window: 50);
         Assert.That(rangeEnd, Is.EqualTo(150));
         Assert.That(data[1], Has.Count.GreaterThan(0));
 
         // All entries should be within the window
         foreach (var entry in data[1])
-            Assert.That(entry.Timestamp, Is.InRange(100, 150));
+            Assert.That(entry.PrimaryIndex, Is.InRange(100, 150));
     }
 }
 
@@ -745,9 +745,9 @@ public class StreamDBStatsTests
         var payload = new TestPayload { Value = 1.0f, Counter = 0 };
         ReadOnlySpan<byte> bytes = MemoryMarshal.AsBytes(new ReadOnlySpan<TestPayload>(in payload));
 
-        _db.Append(1, bytes, timestamp: 200, version: 1);
-        _db.Append(1, bytes, timestamp: 100, version: 1); // late
-        _db.Append(1, bytes, timestamp: 50, version: 1);  // late
+        _db.Append(primaryIndex: 200, secondaryIndex: 1, version: 1, payload: bytes);
+        _db.Append(primaryIndex: 100, secondaryIndex: 1, version: 1, payload: bytes); // late
+        _db.Append(primaryIndex: 50, secondaryIndex: 1, version: 1, payload: bytes);  // late
 
         var stats = _db.GetStats();
         Assert.That(stats.LateArrivals, Is.EqualTo(2));
@@ -767,7 +767,7 @@ public class StreamDBDisposeTests
         try
         {
             byte[] payloadBytes = new byte[8];
-            Assert.Throws<ObjectDisposedException>(() => db.Append(1, payloadBytes, 100, 1));
+            Assert.Throws<ObjectDisposedException>(() => db.Append(100, 1, 1, payloadBytes));
         }
         finally
         {
@@ -845,7 +845,7 @@ public class StreamDBConcurrencyTests
             {
                 var payload = new TestPayload { Value = i, Counter = secondaryIndex };
                 ReadOnlySpan<byte> bytes = MemoryMarshal.AsBytes(new ReadOnlySpan<TestPayload>(in payload));
-                _db.Append(secondaryIndex, bytes, timestamp: 1000 + i, version: 1);
+                _db.Append(primaryIndex: 1000 + i, secondaryIndex: secondaryIndex, version: 1, payload: bytes);
             }
         });
 
@@ -853,7 +853,7 @@ public class StreamDBConcurrencyTests
 
         for (int idx = 0; idx < indexCount; idx++)
         {
-            var results = _db.ReadRange(secondaryIndex: idx, startTs: 1000, endTs: 1999);
+            var results = _db.ReadRange(secondaryIndex: idx, startPrimaryIndex: 1000, endPrimaryIndex: 1999);
             Assert.That(results, Has.Count.EqualTo(writesPerIndex),
                 $"Secondary index {idx} should have {writesPerIndex} entries");
         }
@@ -887,10 +887,10 @@ public class StreamDBLargePayloadTests
         byte[] largePayload = new byte[1024];
         Random.Shared.NextBytes(largePayload);
 
-        _db.Append(secondaryIndex: 1, payload: largePayload, timestamp: 100, version: 1);
+        _db.Append(primaryIndex: 100, secondaryIndex: 1, version: 1, payload: largePayload);
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(secondaryIndex: 1, startTs: 100, endTs: 100);
+        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 100);
         Assert.That(results, Has.Count.EqualTo(1));
         Assert.That(results[0].Payload, Is.EqualTo(largePayload));
     }
@@ -898,10 +898,10 @@ public class StreamDBLargePayloadTests
     [Test]
     public void EmptyPayload_WritesAndReadsCorrectly()
     {
-        _db.Append(secondaryIndex: 1, payload: ReadOnlySpan<byte>.Empty, timestamp: 100, version: 1);
+        _db.Append(primaryIndex: 100, secondaryIndex: 1, version: 1, payload: ReadOnlySpan<byte>.Empty);
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(secondaryIndex: 1, startTs: 100, endTs: 100);
+        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 100);
         Assert.That(results, Has.Count.EqualTo(1));
         Assert.That(results[0].Payload, Is.Empty);
     }
