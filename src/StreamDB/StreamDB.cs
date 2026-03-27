@@ -398,7 +398,16 @@ namespace StreamDB
             if (primaryIndex < maxPi)
             {
                 Interlocked.Increment(ref _lateArrivalCount);
-                _lateArrivals.Insert(secondaryIndex, primaryIndex, version, payload);
+                // Acquire read lock so late arrival writes are blocked during checkpoint (write lock)
+                _indexWriteLock.EnterReadLock();
+                try
+                {
+                    _lateArrivals.Insert(secondaryIndex, primaryIndex, version, payload);
+                }
+                finally
+                {
+                    _indexWriteLock.ExitReadLock();
+                }
                 return;
             }
 
