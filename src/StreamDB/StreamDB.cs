@@ -4,8 +4,9 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using FASTER.core;
 using Microsoft.Data.Sqlite;
+using Microsoft.Extensions.Logging;
 
-namespace WebServer.Storage
+namespace StreamDB
 {
     /// <summary>
     /// Schema-on-read stream storage engine. Shards writes across a fixed pool of FasterLog

@@ -1,7 +1,7 @@
 using System.Collections.Concurrent;
 using Microsoft.Data.Sqlite;
 
-namespace WebServer.Storage;
+namespace StreamDB;
 
 /// <summary>
 /// A lightweight wrapper that returns a <see cref="SqliteConnection"/> to a

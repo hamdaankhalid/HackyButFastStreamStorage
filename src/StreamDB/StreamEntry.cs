@@ -1,6 +1,6 @@
 using System.Runtime.InteropServices;
 
-namespace WebServer.Storage
+namespace StreamDB
 {
     /// <summary>
     /// Header layout for records stored in FasterLog.

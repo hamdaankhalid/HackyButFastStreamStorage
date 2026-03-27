@@ -18,8 +18,10 @@ StreamDB is purpose-built for workloads where data arrives fast and needs to be 
 ## Quick Start
 
 ```csharp
+using StreamDB;
+
 // Create a StreamDB instance
-var db = new StreamDB(
+var db = new StreamDB.StreamDB(
     baseDir: "my-streams",
     retentionPeriod: TimeSpan.FromDays(30),
     logger: logger
@@ -42,12 +44,25 @@ StreamDbStats stats = db.GetStats();
 
 ## Project Structure
 
-| File | Description |
-|------|-------------|
-| `StreamDB.cs` | Core storage engine — sharding, write path, read path, maintenance |
-| `StreamEntry.cs` | Record header layout and entry struct |
-| `StreamVersionRegistry.cs` | Caller-side payload versioning and deserialization |
-| `PooledConnection.cs` | Lightweight SQLite connection pool |
+```
+StreamDB.sln
+├── src/StreamDB/              # Class library
+│   ├── StreamDB.cs            # Core storage engine
+│   ├── StreamEntry.cs         # Record header layout and entry struct
+│   ├── StreamVersionRegistry.cs # Payload versioning utility
+│   └── PooledConnection.cs    # SQLite connection pool
+├── samples/StreamDB.Sample/   # Console app demo
+│   └── Program.cs             # Write + read + stats example
+├── docs/
+│   └── architecture.md        # Full technical documentation
+└── LICENSE
+```
+
+### Running the Sample
+
+```bash
+dotnet run --project samples/StreamDB.Sample
+```
 
 ## Documentation
 

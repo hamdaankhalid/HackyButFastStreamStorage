@@ -1,7 +1,7 @@
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
-namespace WebServer.Storage
+namespace StreamDB
 {
     /// <summary>
     /// Caller-side utility for deserializing <see cref="StreamEntry"/> payloads into typed structs.

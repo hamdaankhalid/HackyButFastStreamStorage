@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/samples/">
+    <Project Path="samples/StreamDB.Sample/StreamDB.Sample.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/StreamDB/StreamDB.csproj" />
+  </Folder>
+</Solution>
