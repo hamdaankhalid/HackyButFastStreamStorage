@@ -120,6 +120,20 @@ public class WriteBenchmarks
     }
 
     [Benchmark]
+    public void StreamDB_AppendOnly()
+    {
+        for (int i = 0; i < RecordCount; i++)
+        {
+            _streamDb.Append(
+                primaryIndex: 1_000_000 + i,
+                secondaryIndex: i % 4,
+                version: 1,
+                payload: _payloadBytes);
+        }
+        // No WaitForPendingWrites — measures actual caller-perceived latency
+    }
+
+    [Benchmark]
     public void SQLite_SequentialWrites()
     {
         using var tx = _sqliteConn.BeginTransaction();

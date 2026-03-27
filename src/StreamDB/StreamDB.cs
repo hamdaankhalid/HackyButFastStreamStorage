@@ -497,14 +497,18 @@ namespace StreamDB
                 secondaryIndex, scanFrom, secondaryIndex & ShardMask);
 
             LogShard shard = GetShard(secondaryIndex);
-            List<StreamEntry> logResults = shard.ScanRange(secondaryIndex, scanFrom, startPrimaryIndex, endPrimaryIndex, limit);
+            List<StreamEntry> results = shard.ScanRange(secondaryIndex, scanFrom, startPrimaryIndex, endPrimaryIndex, limit);
 
-            // Merge with late arrivals
-            List<StreamEntry> lateResults = _lateArrivals.QueryRange(secondaryIndex, startPrimaryIndex, endPrimaryIndex, limit);
-            List<StreamEntry> results = MergeByPrimaryIndex(logResults, lateResults, limit);
+            // Only query the late arrivals store if there are any late arrivals
+            if (Volatile.Read(ref _lateArrivalCount) > 0)
+            {
+                List<StreamEntry> lateResults = _lateArrivals.QueryRange(secondaryIndex, startPrimaryIndex, endPrimaryIndex, limit);
+                if (lateResults.Count > 0)
+                    results = MergeByPrimaryIndex(results, lateResults, limit);
+            }
 
-            _logger?.LogDebug("ReadRange: secondaryIndex={SecondaryIndex} -> returned {Count} items (log={LogCount}, late={LateCount})",
-                secondaryIndex, results.Count, logResults.Count, lateResults.Count);
+            _logger?.LogDebug("ReadRange: secondaryIndex={SecondaryIndex} -> returned {Count} items",
+                secondaryIndex, results.Count);
 
             return results;
         }
@@ -559,8 +563,9 @@ namespace StreamDB
                 }
             }
 
-            // Merge with late arrivals
-            MergeLateArrivals(result, _lateArrivals.QueryRange(indexList, startPrimaryIndex, endPrimaryIndex, limit), limit);
+            // Only merge with late arrivals if there are any
+            if (Volatile.Read(ref _lateArrivalCount) > 0)
+                MergeLateArrivals(result, _lateArrivals.QueryRange(indexList, startPrimaryIndex, endPrimaryIndex, limit), limit);
 
             var totalItems = result.Values.Sum(list => list.Count);
             _logger?.LogDebug("ReadRange (multi-index): returned {TotalItems} items across {Count} indexes",
@@ -598,8 +603,9 @@ namespace StreamDB
                 }
             }
 
-            // Merge with late arrivals
-            MergeLateArrivals(result, _lateArrivals.QueryRangeAll(startPrimaryIndex, endPrimaryIndex, limit), limit);
+            // Only merge with late arrivals if there are any
+            if (Volatile.Read(ref _lateArrivalCount) > 0)
+                MergeLateArrivals(result, _lateArrivals.QueryRangeAll(startPrimaryIndex, endPrimaryIndex, limit), limit);
 
             var totalItems = result.Values.Sum(list => list.Count);
             _logger?.LogDebug("ReadRange (all-indexes): returned {TotalItems} items across {Count} indexes",
@@ -658,10 +664,13 @@ namespace StreamDB
                     globalMin = shardMin.Value;
             }
 
-            // Also check late arrivals
-            long? lateMin = _lateArrivals.GetEarliestPrimaryIndex(indexList, fromPrimaryIndex);
-            if (lateMin.HasValue && (!globalMin.HasValue || lateMin.Value < globalMin.Value))
-                globalMin = lateMin.Value;
+            // Also check late arrivals if any exist
+            if (Volatile.Read(ref _lateArrivalCount) > 0)
+            {
+                long? lateMin = _lateArrivals.GetEarliestPrimaryIndex(indexList, fromPrimaryIndex);
+                if (lateMin.HasValue && (!globalMin.HasValue || lateMin.Value < globalMin.Value))
+                    globalMin = lateMin.Value;
+            }
 
             _logger?.LogDebug("GetEarliestPrimaryIndex: final result = {GlobalMin}",
                 globalMin?.ToString() ?? "null");
@@ -715,8 +724,12 @@ namespace StreamDB
             using PooledConnection pooled = GetConnection();
             using SqliteCommand cmd = pooled.Connection.CreateCommand();
             cmd.CommandText = "SELECT log_address FROM stream_index WHERE secondary_index = $sidx AND primary_index <= $pi ORDER BY primary_index DESC LIMIT 1";
-            cmd.Parameters.AddWithValue("$sidx", secondaryIndex);
-            cmd.Parameters.AddWithValue("$pi", startPrimaryIndex);
+            SqliteParameter pSidx = cmd.Parameters.Add("$sidx", SqliteType.Integer);
+            SqliteParameter pPi = cmd.Parameters.Add("$pi", SqliteType.Integer);
+            cmd.Prepare();
+
+            pSidx.Value = secondaryIndex;
+            pPi.Value = startPrimaryIndex;
             object? result = cmd.ExecuteScalar();
             long addr = result is long a ? a : 0L;
 
@@ -773,13 +786,16 @@ namespace StreamDB
             }
 
             // Merge with latest from late arrivals — keep whichever has the higher primary index
-            Dictionary<int, StreamEntry> lateLatest = _lateArrivals.GetLatest();
+            if (Volatile.Read(ref _lateArrivalCount) > 0)
+            {
+                Dictionary<int, StreamEntry> lateLatest = _lateArrivals.GetLatest();
             foreach ((int idx, StreamEntry lateEntry) in lateLatest)
             {
                 if (!result.TryGetValue(idx, out StreamEntry existing) || lateEntry.PrimaryIndex > existing.PrimaryIndex)
                 {
                     result[idx] = lateEntry;
                 }
+            }
             }
 
             _logger?.LogDebug("ReadLatest: returned latest data for {Count} index(es)", result.Count);
