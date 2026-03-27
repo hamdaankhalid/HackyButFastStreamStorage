@@ -1,8 +1,6 @@
 ﻿using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
-using FASTER.core;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
 
@@ -16,7 +14,8 @@ namespace StreamDB
     /// [8B timestamp (primary index)] [4B secondary index] [2B version] [2B payload length] [payload bytes]
     ///
     /// The secondary index is used for sharding (<c>secondaryIndex &amp; ShardMask</c>) and scan filtering.
-    /// For telemetry data the secondary index stores the device ID.
+    /// For telemetry data the secondary index typically stores the device ID, but it can represent
+    /// any grouping key (sensor ID, user ID, region, etc.).
     ///
     /// Write path: Append header + payload bytes to the shard, every Nth write insert (timestamp, address) into SQLite.
     /// Read path:  Query SQLite for the closest address ≤ startTs, scan the shard filtering by secondary index.
@@ -29,7 +28,6 @@ namespace StreamDB
         #region member variables and Consts
 
         private const string StreamIndexDbName = "stream_index.db";
-        private const string ShardLogFmt = "shard_{0}.log";
 
         // Adaptive indexing parameters - dynamically adjusted based on queue backpressure
 
@@ -65,7 +63,7 @@ namespace StreamDB
 
         // Number of FasterLog shards – must be a power of 2.
         private const int ShardCount = 1 << 2;
-        // Bit-mask for fast shard selection: deviceId & ShardMask == deviceId % ShardCount.
+        // Bit-mask for fast shard selection: secondaryIndex & ShardMask == secondaryIndex % ShardCount.
         private const int ShardMask = ShardCount - 1;
 
         private readonly string _baseDir;
@@ -73,7 +71,7 @@ namespace StreamDB
         private readonly ConcurrentDictionary<int, int> _writeCounts = new();
         private readonly string _connectionString;
         private readonly ConcurrentQueue<SqliteConnection> _connPool = new();
-        private readonly ConcurrentQueue<(int DeviceId, long Timestamp, long Address)> _pendingIndexInserts = new();
+        private readonly ConcurrentQueue<(int SecondaryIndex, long Timestamp, long Address)> _pendingIndexInserts = new();
         private readonly TimeSpan _retentionPeriod;
         private readonly Timer _retentionTimer;
         private readonly Timer _checkpointTimer;
@@ -98,6 +96,11 @@ namespace StreamDB
         private int _batchesSinceLastAdjustment = 0;
         private const int MinBatchesBetweenAdjustments = 5;
 
+        // Late arrivals: out-of-order write support
+        private readonly ConcurrentDictionary<int, long> _maxTimestamps = new();
+        private readonly LateArrivalsStore _lateArrivals;
+        private long _lateArrivalCount = 0;
+
         #endregion
 
         public StreamDB(string? baseDir = null, TimeSpan? retentionPeriod = null, TimeSpan? checkpointInterval = null, ILogger<StreamDB>? logger = null)
@@ -121,13 +124,15 @@ namespace StreamDB
             cmd.CommandText =
                 """
                 CREATE TABLE IF NOT EXISTS stream_index (
-                    device_id INTEGER NOT NULL,
+                    secondary_index INTEGER NOT NULL,
                     timestamp INTEGER NOT NULL,
                     log_address INTEGER NOT NULL,
-                    PRIMARY KEY (device_id, timestamp)
+                    PRIMARY KEY (secondary_index, timestamp)
                 ) WITHOUT ROWID;
                 """;
             cmd.ExecuteNonQuery();
+
+            _lateArrivals = new LateArrivalsStore(GetConnection);
 
             _shards = new LogShard[ShardCount];
             for (int i = 0; i < ShardCount; i++)
@@ -177,7 +182,7 @@ namespace StreamDB
             cmd.CommandText =
                 """
                 DELETE FROM stream_index
-                WHERE (device_id & $mask) = $shard
+                WHERE (secondary_index & $mask) = $shard
                   AND (log_address < $begin OR log_address >= $tail)
                 """;
             SqliteParameter pMask = cmd.Parameters.Add("$mask", SqliteType.Integer);
@@ -212,7 +217,7 @@ namespace StreamDB
         private void FlushWorker()
         {
             // long lived allocations in the worker to avoid repeated allocations in the hot path
-            List<(int DeviceId, long Timestamp, long Address)> batch = new List<(int DeviceId, long Timestamp, long Address)>(capacity: AdaptiveTuning[^1].batchSize);
+            List<(int SecondaryIndex, long Timestamp, long Address)> batch = new List<(int SecondaryIndex, long Timestamp, long Address)>(capacity: AdaptiveTuning[^1].batchSize);
             HashSet<int> referencedShards = new HashSet<int>(capacity: ShardCount);
             var maxAddrPerShard = new long[ShardCount];
 
@@ -247,13 +252,13 @@ namespace StreamDB
                             (int _, int batchSize, int _) = AdaptiveTuning[adaptiveIdx];
 
                             int collected = 0;
-                            while (collected < batchSize && _pendingIndexInserts.TryDequeue(out (int DeviceId, long Timestamp, long Address) entry))
+                            while (collected < batchSize && _pendingIndexInserts.TryDequeue(out (int SecondaryIndex, long Timestamp, long Address) entry))
                             {
                                 // Successfully dequeued - decrement count immediately
                                 Interlocked.Decrement(ref _pendingIndexCount);
 
                                 batch.Add(entry);
-                                var shardIndex = entry.DeviceId & ShardMask;
+                                var shardIndex = entry.SecondaryIndex & ShardMask;
                                 referencedShards.Add(shardIndex);
                                 if (entry.Address > maxAddrPerShard[shardIndex])
                                 {
@@ -286,16 +291,16 @@ namespace StreamDB
                             using SqliteTransaction tx = pooled.Connection.BeginTransaction();
                             using SqliteCommand cmd = pooled.Connection.CreateCommand();
                             cmd.Transaction = tx;
-                            cmd.CommandText = "INSERT INTO stream_index (device_id, timestamp, log_address) VALUES ($did, $ts, $addr)";
-                            SqliteParameter pDid = cmd.Parameters.Add("$did", SqliteType.Integer);
+                            cmd.CommandText = "INSERT INTO stream_index (secondary_index, timestamp, log_address) VALUES ($sidx, $ts, $addr)";
+                            SqliteParameter pDid = cmd.Parameters.Add("$sidx", SqliteType.Integer);
                             SqliteParameter pTs = cmd.Parameters.Add("$ts", SqliteType.Integer);
                             SqliteParameter pAddr = cmd.Parameters.Add("$addr", SqliteType.Integer);
                             cmd.Prepare();
 
                             int written = 0;
-                            foreach ((int DeviceId, long Timestamp, long Address) entry in batch)
+                            foreach ((int SecondaryIndex, long Timestamp, long Address) entry in batch)
                             {
-                                pDid.Value = entry.DeviceId;
+                                pDid.Value = entry.SecondaryIndex;
                                 pTs.Value = entry.Timestamp;
                                 pAddr.Value = entry.Address;
                                 cmd.ExecuteNonQuery();
@@ -359,11 +364,27 @@ namespace StreamDB
         /// Append a record to the stream. The record is stored with a 16-byte header
         /// followed by the raw payload bytes. The secondary index is used for shard selection
         /// and sparse indexing; the timestamp is the primary index for range queries.
+        ///
+        /// If the timestamp is lower than the maximum previously seen for this secondary index
+        /// (a late arrival), the entry is routed to a SQLite side store instead of FasterLog.
+        /// Reads merge both sources transparently.
         /// </summary>
         public void Append(int secondaryIndex, ReadOnlySpan<byte> payload, long timestamp, ushort version)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
 
+            // Detect out-of-order (late arrival) writes.
+            // AddOrUpdate returns the NEW value: max(prev, timestamp).
+            // If timestamp < returned value, a higher timestamp was already seen → late arrival.
+            long maxTs = _maxTimestamps.AddOrUpdate(secondaryIndex, timestamp, (_, prev) => Math.Max(prev, timestamp));
+            if (timestamp < maxTs)
+            {
+                Interlocked.Increment(ref _lateArrivalCount);
+                _lateArrivals.Insert(secondaryIndex, timestamp, version, payload);
+                return;
+            }
+
+            // Normal (monotonic) path: append to FasterLog
             LogShard shard = GetShard(secondaryIndex);
             int count = _writeCounts.AddOrUpdate(secondaryIndex, 1, static (_, prev) => prev + 1);
 
@@ -425,7 +446,8 @@ namespace StreamDB
                 Volatile.Read(ref _scaleDownCount),
                 Volatile.Read(ref _droppedIndexEntries),
                 Volatile.Read(ref _adaptiveIdx),
-                Volatile.Read(ref _pendingIndexCount)
+                Volatile.Read(ref _pendingIndexCount),
+                Volatile.Read(ref _lateArrivalCount)
             );
 
         #endregion
@@ -444,28 +466,32 @@ namespace StreamDB
                 secondaryIndex, scanFrom, secondaryIndex & ShardMask);
 
             LogShard shard = GetShard(secondaryIndex);
-            List<StreamEntry> results = shard.ScanRange(secondaryIndex, scanFrom, startTs, endTs, limit);
+            List<StreamEntry> logResults = shard.ScanRange(secondaryIndex, scanFrom, startTs, endTs, limit);
 
-            _logger?.LogDebug("ReadRange: secondaryIndex={SecondaryIndex} -> returned {Count} items",
-                secondaryIndex, results.Count);
+            // Merge with late arrivals
+            List<StreamEntry> lateResults = _lateArrivals.QueryRange(secondaryIndex, startTs, endTs, limit);
+            List<StreamEntry> results = MergeByTimestamp(logResults, lateResults, limit);
+
+            _logger?.LogDebug("ReadRange: secondaryIndex={SecondaryIndex} -> returned {Count} items (log={LogCount}, late={LateCount})",
+                secondaryIndex, results.Count, logResults.Count, lateResults.Count);
 
             return results;
         }
 
         /// <summary>
-        /// Multi-device overload of ReadRange. Groups devices by shard to minimize redundant scanning.
-        /// For each shard, looks up the nearest address ≤ startTs across all devices in that shard, 
-        /// then scans once per shard to collect results for all devices. Returns a dictionary keyed by secondary index.
+        /// Multi-index overload of ReadRange. Groups secondary indexes by shard to minimize redundant scanning.
+        /// For each shard, looks up the nearest address ≤ startTs across all indexes in that shard, 
+        /// then scans once per shard to collect results for all indexes. Returns a dictionary keyed by secondary index.
         /// </summary>
         public Dictionary<int, List<StreamEntry>> ReadRange(IEnumerable<int> secondaryIndexes, long startTs, long endTs, int limit = 0)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
 
             List<int> indexList = secondaryIndexes.ToList();
-            _logger?.LogDebug("ReadRange (multi-device): secondaryIndexes=[{Indexes}], startTs={StartTs}, endTs={EndTs}, limit={Limit}",
+            _logger?.LogDebug("ReadRange (multi-index): secondaryIndexes=[{Indexes}], startTs={StartTs}, endTs={EndTs}, limit={Limit}",
                 string.Join(", ", indexList), startTs, endTs, limit);
 
-            // Group devices by shard so we can scan each shard at most once.
+            // Group secondary indexes by shard so we can scan each shard at most once.
             Dictionary<int, (HashSet<int> Indexes, long MinAddress)> shardGroups = new Dictionary<int, (HashSet<int> Indexes, long MinAddress)>();
 
             foreach (int idx in indexList)
@@ -487,11 +513,11 @@ namespace StreamDB
 
             Dictionary<int, List<StreamEntry>> result = new Dictionary<int, List<StreamEntry>>();
 
-            _logger?.LogDebug("ReadRange (multi-device): grouped into {ShardCount} shards", shardGroups.Count);
+            _logger?.LogDebug("ReadRange (multi-index): grouped into {ShardCount} shards", shardGroups.Count);
 
             foreach ((int shardIndex, (HashSet<int>? indexes, long minAddress)) in shardGroups)
             {
-                _logger?.LogDebug("ReadRange (multi-device): scanning shard {ShardIndex} with {Count} indexes from address {MinAddress}",
+                _logger?.LogDebug("ReadRange (multi-index): scanning shard {ShardIndex} with {Count} indexes from address {MinAddress}",
                     shardIndex, indexes.Count, minAddress);
 
                 Dictionary<int, List<StreamEntry>> shardResults = _shards[shardIndex].ScanRange(indexes, minAddress, startTs, endTs, limit);
@@ -502,22 +528,25 @@ namespace StreamDB
                 }
             }
 
+            // Merge with late arrivals
+            MergeLateArrivals(result, _lateArrivals.QueryRange(indexList, startTs, endTs, limit), limit);
+
             var totalItems = result.Values.Sum(list => list.Count);
-            _logger?.LogDebug("ReadRange (multi-device): returned {TotalItems} items across {Count} indexes",
+            _logger?.LogDebug("ReadRange (multi-index): returned {TotalItems} items across {Count} indexes",
                 totalItems, result.Count);
 
             return result;
         }
 
         /// <summary>
-        /// All-devices overload of ReadRange. Scans all shards and returns data for every secondary index
+        /// All-indexes overload of ReadRange. Scans all shards and returns data for every secondary index
         /// that has data in the specified time range.
         /// </summary>
         public Dictionary<int, List<StreamEntry>> ReadRange(long startTs, long endTs, int limit = 0)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
 
-            _logger?.LogDebug("ReadRange (all-devices): startTs={StartTs}, endTs={EndTs}, limit={Limit}",
+            _logger?.LogDebug("ReadRange (all-indexes): startTs={StartTs}, endTs={EndTs}, limit={Limit}",
                 startTs, endTs, limit);
 
             Dictionary<int, List<StreamEntry>> result = new Dictionary<int, List<StreamEntry>>();
@@ -527,10 +556,10 @@ namespace StreamDB
             {
                 long addr = LookupNearestAddressForShard(shardIndex, startTs);
 
-                _logger?.LogDebug("ReadRange (all-devices): scanning shard {ShardIndex} from address {Address}",
+                _logger?.LogDebug("ReadRange (all-indexes): scanning shard {ShardIndex} from address {Address}",
                     shardIndex, addr);
 
-                Dictionary<int, List<StreamEntry>> shardResults = _shards[shardIndex].ScanRangeAllDevices(addr, startTs, endTs, limit);
+                Dictionary<int, List<StreamEntry>> shardResults = _shards[shardIndex].ScanRangeAll(addr, startTs, endTs, limit);
 
                 foreach ((int idx, List<StreamEntry>? items) in shardResults)
                 {
@@ -538,8 +567,11 @@ namespace StreamDB
                 }
             }
 
+            // Merge with late arrivals
+            MergeLateArrivals(result, _lateArrivals.QueryRangeAll(startTs, endTs, limit), limit);
+
             var totalItems = result.Values.Sum(list => list.Count);
-            _logger?.LogDebug("ReadRange (all-devices): returned {TotalItems} items across {Count} indexes",
+            _logger?.LogDebug("ReadRange (all-indexes): returned {TotalItems} items across {Count} indexes",
                 totalItems, result.Count);
 
             return result;
@@ -547,7 +579,8 @@ namespace StreamDB
 
         /// <summary>
         /// Returns the minimum earliest timestamp across all requested secondary indexes by scanning
-        /// the FasterLog from the sparse index pointer. Returns null if no data exists.
+        /// the FasterLog from the sparse index pointer and checking the late arrivals store.
+        /// Returns null if no data exists.
         /// </summary>
         public long? GetEarliestTimestamp(IEnumerable<int> secondaryIndexes, long fromTs)
         {
@@ -594,6 +627,11 @@ namespace StreamDB
                     globalMin = shardMin.Value;
             }
 
+            // Also check late arrivals
+            long? lateMin = _lateArrivals.GetEarliestTimestamp(indexList, fromTs);
+            if (lateMin.HasValue && (!globalMin.HasValue || lateMin.Value < globalMin.Value))
+                globalMin = lateMin.Value;
+
             _logger?.LogDebug("GetEarliestTimestamp: final result = {GlobalMin}",
                 globalMin?.ToString() ?? "null");
 
@@ -601,9 +639,9 @@ namespace StreamDB
         }
 
         /// <summary>
-        /// Combined availability-check and range-read in a single operation. Scans forward
-        /// from <paramref name="fromTs"/>, discovers the first matching entry, then collects
-        /// a window of <paramref name="windowMs"/> milliseconds of data from that point.
+        /// Combined availability-check and range-read in a single operation. Finds the earliest
+        /// available entry ≥ <paramref name="fromTs"/> across both FasterLog and late arrivals,
+        /// then reads a window of <paramref name="windowMs"/> milliseconds of data from that point.
         ///
         /// Returns <c>rangeEndMs = -1</c> when no data exists for any secondary index.
         /// </summary>
@@ -612,104 +650,47 @@ namespace StreamDB
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
 
+            List<int> indexList = secondaryIndexes.ToList();
+
             _logger?.LogDebug("ReadRangeFromAvailable: secondaryIndexes=[{Indexes}], fromTs={FromTs}, windowMs={WindowMs}, limit={Limit}",
-                string.Join(", ", secondaryIndexes), fromTs, windowMs, limit);
+                string.Join(", ", indexList), fromTs, windowMs, limit);
 
-            // Group by shard
-            Dictionary<int, (HashSet<int> Indexes, long MinAddress)> shardGroups = new Dictionary<int, (HashSet<int> Indexes, long MinAddress)>();
-
-            foreach (int idx in secondaryIndexes)
-            {
-                int shardIndex = idx & ShardMask;
-                long addr = LookupNearestAddress(idx, fromTs);
-
-                if (shardGroups.TryGetValue(shardIndex, out (HashSet<int> Indexes, long MinAddress) group))
-                {
-                    group.Indexes.Add(idx);
-                    if (addr < group.MinAddress)
-                        shardGroups[shardIndex] = (group.Indexes, addr);
-                }
-                else
-                {
-                    shardGroups[shardIndex] = (new HashSet<int> { idx }, addr);
-                }
-            }
-
-            // Single scan per shard: find first entry and collect window in one pass.
-            long? globalMin = null;
-            List<(long? FirstTs, Dictionary<int, List<StreamEntry>> Data)> shardResults = new List<(long? FirstTs, Dictionary<int, List<StreamEntry>> Data)>(shardGroups.Count);
-
-            foreach ((int shardIndex, (HashSet<int>? indexes, long minAddress)) in shardGroups)
-            {
-                _logger?.LogDebug("ReadRangeFromAvailable: scanning shard {ShardIndex} with {Count} indexes from address {MinAddress}",
-                    shardIndex, indexes.Count, minAddress);
-
-                (long? FirstTimestamp, Dictionary<int, List<StreamEntry>> Data) result = _shards[shardIndex].FindAndScanRange(indexes, minAddress, fromTs, windowMs, limit);
-                shardResults.Add(result);
-
-                if (result.FirstTimestamp.HasValue && (!globalMin.HasValue || result.FirstTimestamp.Value < globalMin.Value))
-                    globalMin = result.FirstTimestamp;
-            }
-
-            if (!globalMin.HasValue)
+            // Find the earliest available timestamp across both sources
+            long? earliest = GetEarliestTimestamp(indexList, fromTs);
+            if (!earliest.HasValue)
             {
                 _logger?.LogDebug("ReadRangeFromAvailable: no data found");
                 return (-1, new Dictionary<int, List<StreamEntry>>());
             }
 
-            long rangeEndMs = globalMin.Value + windowMs;
+            long rangeEndMs = earliest.Value + windowMs;
 
-            // Merge shard results, trimming entries beyond the canonical window.
-            Dictionary<int, List<StreamEntry>> merged = new Dictionary<int, List<StreamEntry>>();
-            foreach ((long? firstTs, Dictionary<int, List<StreamEntry>>? data) in shardResults)
-            {
-                foreach ((int idx, List<StreamEntry>? items) in data)
-                {
-                    if (items.Count == 0)
-                        continue;
+            // ReadRange already merges FasterLog + late arrivals
+            Dictionary<int, List<StreamEntry>> data = ReadRange(indexList, earliest.Value, rangeEndMs, limit);
 
-                    // Trim entries that fall beyond rangeEndMs
-                    if (firstTs.HasValue && firstTs.Value != globalMin.Value && items[^1].Timestamp > rangeEndMs)
-                    {
-                        int lo = 0, hi = items.Count;
-                        while (lo < hi)
-                        {
-                            int mid = lo + (hi - lo) / 2;
-                            if (items[mid].Timestamp <= rangeEndMs)
-                                lo = mid + 1;
-                            else
-                                hi = mid;
-                        }
-                        if (lo < items.Count)
-                            items.RemoveRange(lo, items.Count - lo);
-                    }
-                    merged[idx] = items;
-                }
-            }
-
-            var totalItems = merged.Values.Sum(list => list.Count);
+            var totalItems = data.Values.Sum(list => list.Count);
             _logger?.LogDebug("ReadRangeFromAvailable: returned {TotalItems} items across {Count} indexes, rangeEndMs={RangeEndMs}",
-                totalItems, merged.Count, rangeEndMs);
+                totalItems, data.Count, rangeEndMs);
 
-            return (rangeEndMs, merged);
+            return (rangeEndMs, data);
         }
 
         /// <summary>
-        /// Find the largest indexed timestamp ≤ startTs for this device.
+        /// Find the largest indexed timestamp ≤ startTs for this secondary index.
         /// Returns the corresponding FasterLog address, or 0 if no index entry exists (scan from beginning).
         /// </summary>
-        private long LookupNearestAddress(int deviceId, long startTs)
+        private long LookupNearestAddress(int secondaryIndex, long startTs)
         {
             using PooledConnection pooled = GetConnection();
             using SqliteCommand cmd = pooled.Connection.CreateCommand();
-            cmd.CommandText = "SELECT log_address FROM stream_index WHERE device_id = $did AND timestamp <= $ts ORDER BY timestamp DESC LIMIT 1";
-            cmd.Parameters.AddWithValue("$did", deviceId);
+            cmd.CommandText = "SELECT log_address FROM stream_index WHERE secondary_index = $sidx AND timestamp <= $ts ORDER BY timestamp DESC LIMIT 1";
+            cmd.Parameters.AddWithValue("$sidx", secondaryIndex);
             cmd.Parameters.AddWithValue("$ts", startTs);
             object? result = cmd.ExecuteScalar();
             long addr = result is long a ? a : 0L;
 
-            _logger?.LogDebug("LookupNearestAddress: deviceId={DeviceId}, startTs={StartTs} -> address={Address}",
-                deviceId, startTs, addr);
+            _logger?.LogDebug("LookupNearestAddress: secondaryIndex={SecondaryIndex}, startTs={StartTs} -> address={Address}",
+                secondaryIndex, startTs, addr);
 
             return addr;
         }
@@ -721,7 +702,7 @@ namespace StreamDB
         {
             using PooledConnection pooled = GetConnection();
             using SqliteCommand cmd = pooled.Connection.CreateCommand();
-            cmd.CommandText = "SELECT DISTINCT device_id FROM stream_index";
+            cmd.CommandText = "SELECT DISTINCT secondary_index FROM stream_index";
             List<int> ids = new List<int>();
             using SqliteDataReader reader = cmd.ExecuteReader();
             while (reader.Read())
@@ -735,6 +716,7 @@ namespace StreamDB
         /// Returns the single latest record for each secondary index that has data in the stream.
         /// Uses the sparse index to efficiently locate the latest data region per index,
         /// then scans forward from there to find the actual latest record.
+        /// Also checks the late arrivals store for entries that may be more recent.
         /// </summary>
         public Dictionary<int, StreamEntry> ReadLatest()
         {
@@ -756,6 +738,16 @@ namespace StreamDB
                 if (records.Count > 0)
                 {
                     result[idx] = records[^1]; // Keep only the latest record
+                }
+            }
+
+            // Merge with latest from late arrivals — keep whichever has the higher timestamp
+            Dictionary<int, StreamEntry> lateLatest = _lateArrivals.GetLatest();
+            foreach ((int idx, StreamEntry lateEntry) in lateLatest)
+            {
+                if (!result.TryGetValue(idx, out StreamEntry existing) || lateEntry.Timestamp > existing.Timestamp)
+                {
+                    result[idx] = lateEntry;
                 }
             }
 
@@ -868,6 +860,7 @@ namespace StreamDB
 
                 long cutoffTs = DateTimeOffset.UtcNow.ToUnixTimeSeconds() - (long)_retentionPeriod.TotalSeconds;
                 PurgeIndexBefore(cutoffTs);
+                _lateArrivals.PurgeBefore(cutoffTs);
                 TruncateShards(cutoffTs);
 
                 _logger?.LogInformation("RunRetention: retention complete");
@@ -896,7 +889,7 @@ namespace StreamDB
         }
 
         /// <summary>
-        /// For each shard, find the minimum surviving log_address across all devices that map
+        /// For each shard, find the minimum surviving log_address across all secondary indexes that map
         /// to that shard, then truncate the FasterLog up to that address.
         /// </summary>
         private void TruncateShards(long cutoffTs)
@@ -908,14 +901,12 @@ namespace StreamDB
             for (int shardIndex = 0; shardIndex < ShardCount; shardIndex++)
             {
                 // Find the minimum log_address among index entries that survived the purge
-                // and belong to devices assigned to this shard.
-                // Since we can't easily filter by shard in SQL (no shard column),
-                // we use the global minimum address for this shard from all devices.
+                // and belong to secondary indexes assigned to this shard.
                 using SqliteCommand cmd = pooled.Connection.CreateCommand();
                 cmd.CommandText =
                     """
                     SELECT MIN(log_address) FROM stream_index
-                    WHERE (device_id & $mask) = $shard
+                    WHERE (secondary_index & $mask) = $shard
                     """;
                 cmd.Parameters.AddWithValue("$mask", ShardMask);
                 cmd.Parameters.AddWithValue("$shard", shardIndex);
@@ -933,8 +924,8 @@ namespace StreamDB
         #region Utils
 
         /// <summary>
-        /// Find the minimum log_address across all devices in a specific shard where timestamp ≤ startTs.
-        /// This provides an efficient starting point for wildcard scans that need to read all devices in a shard.
+        /// Find the minimum log_address across all secondary indexes in a specific shard where timestamp ≤ startTs.
+        /// This provides an efficient starting point for wildcard scans that need to read all indexes in a shard.
         /// Returns 0 if no index entry exists (scan from beginning).
         /// </summary>
         private long LookupNearestAddressForShard(int shardIndex, long startTs)
@@ -944,7 +935,7 @@ namespace StreamDB
             cmd.CommandText = @"
                 SELECT MIN(log_address) 
                 FROM stream_index 
-                WHERE (device_id & $mask) = $shard 
+                WHERE (secondary_index & $mask) = $shard 
                   AND timestamp <= $ts";
             cmd.Parameters.AddWithValue("$mask", ShardMask);
             cmd.Parameters.AddWithValue("$shard", shardIndex);
@@ -975,6 +966,53 @@ namespace StreamDB
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private LogShard GetShard(int secondaryIndex) => _shards[secondaryIndex & ShardMask];
+
+        /// <summary>
+        /// Merge two timestamp-sorted lists into one, applying an optional per-index limit.
+        /// Both input lists must be sorted by timestamp ascending.
+        /// </summary>
+        private static List<StreamEntry> MergeByTimestamp(List<StreamEntry> a, List<StreamEntry> b, int limit = 0)
+        {
+            if (b.Count == 0) return a;
+            if (a.Count == 0) return b;
+
+            var merged = new List<StreamEntry>(a.Count + b.Count);
+            int i = 0, j = 0;
+            while (i < a.Count && j < b.Count)
+            {
+                if (limit > 0 && merged.Count >= limit) break;
+                if (a[i].Timestamp <= b[j].Timestamp)
+                    merged.Add(a[i++]);
+                else
+                    merged.Add(b[j++]);
+            }
+            while (i < a.Count && (limit <= 0 || merged.Count < limit)) merged.Add(a[i++]);
+            while (j < b.Count && (limit <= 0 || merged.Count < limit)) merged.Add(b[j++]);
+
+            return merged;
+        }
+
+        /// <summary>
+        /// Merge late arrivals into a multi-index result dictionary. For each secondary index,
+        /// merges the timestamp-sorted lists and applies the per-index limit.
+        /// </summary>
+        private static void MergeLateArrivals(Dictionary<int, List<StreamEntry>> result, Dictionary<int, List<StreamEntry>> lateResults, int limit)
+        {
+            foreach ((int idx, List<StreamEntry> lateEntries) in lateResults)
+            {
+                if (result.TryGetValue(idx, out List<StreamEntry>? existing))
+                {
+                    result[idx] = MergeByTimestamp(existing, lateEntries, limit);
+                }
+                else
+                {
+                    result[idx] = limit > 0 && lateEntries.Count > limit
+                        ? lateEntries.GetRange(0, limit)
+                        : lateEntries;
+                }
+            }
+        }
+
         #endregion
 
         public void Dispose()
@@ -1025,297 +1063,7 @@ namespace StreamDB
             // previous indexed entry.
         }
 
-        /// <summary>
-        /// A single FasterLog shard shared by multiple secondary indexes.
-        /// Entries are assigned to shards via <c>secondaryIndex &amp; ShardMask</c>.
-        /// </summary>
-        private sealed class LogShard : IDisposable
-        {
-            private readonly FasterLog _log;
-
-            public long BeginAddress => _log.BeginAddress;
-            public long TailAddress => _log.TailAddress;
-
-            public LogShard(int shardIndex, string baseDir)
-            {
-                string logPath = Path.Combine(baseDir, shardIndex.ToString(), string.Format(ShardLogFmt, shardIndex));
-                FasterLogSettings settings = new FasterLogSettings
-                {
-                    LogDevice = Devices.CreateLogDevice(logPath, deleteOnClose: false),
-                    TryRecoverLatest = true,
-                    AutoRefreshSafeTailAddress = true,
-                };
-                _log = new FasterLog(settings);
-            }
-
-            /// <summary>
-            /// Write a record with header + payload to the log.
-            /// Header: [8B timestamp][4B secondaryIndex][2B version][2B payloadLength]
-            /// </summary>
-            public long Enqueue(int secondaryIndex, ReadOnlySpan<byte> payload, long timestamp, ushort version)
-            {
-                int totalSize = StreamHeader.Size + payload.Length;
-                Span<byte> buffer = totalSize <= 256
-                    ? stackalloc byte[totalSize]
-                    : new byte[totalSize];
-
-                StreamHeader.Write(buffer, timestamp, secondaryIndex, version, (ushort)payload.Length);
-                payload.CopyTo(buffer[StreamHeader.Size..]);
-
-                return _log.Enqueue(buffer);
-            }
-
-            /// <summary>
-            /// Single-index scan. Delegates to the multi-index overload.
-            /// </summary>
-            public List<StreamEntry> ScanRange(int secondaryIndex, long fromAddress, long startTs, long endTs, int limit = 0)
-            {
-                Dictionary<int, List<StreamEntry>> results = ScanRange(new HashSet<int>(1) { secondaryIndex }, fromAddress, startTs, endTs, limit);
-                return results[secondaryIndex];
-            }
-
-            /// <summary>
-            /// Scan the shard once from <paramref name="fromAddress"/> and collect entries for all
-            /// secondary indexes in <paramref name="indexes"/> whose timestamps fall within [startTs, endTs].
-            /// Timestamps are read from the header (primary index), secondary indexes from the header.
-            /// </summary>
-            public Dictionary<int, List<StreamEntry>> ScanRange(HashSet<int> indexes, long fromAddress, long startTs, long endTs, int limit = 0)
-            {
-                Dictionary<int, List<StreamEntry>> results = new Dictionary<int, List<StreamEntry>>(indexes.Count);
-                foreach (int id in indexes)
-                    results[id] = new List<StreamEntry>();
-
-                long beginAddr = Math.Max(fromAddress, _log.BeginAddress);
-                long tailAddr = _log.SafeTailAddress;
-
-                if (beginAddr >= tailAddr)
-                    return results;
-
-                HashSet<int> finished = new HashSet<int>();
-                bool hasLimit = limit > 0;
-
-                using FasterLogScanIterator iter = _log.Scan(beginAddr, tailAddr, scanUncommitted: true);
-                while (iter.GetNext(out byte[] entry, out int entryLength, out _))
-                {
-                    if (entryLength < StreamHeader.Size)
-                        continue;
-
-                    // Read secondary index from header for fast-path filtering
-                    int entryIdx = StreamHeader.ReadSecondaryIndex(entry.AsSpan());
-                    if (!indexes.Contains(entryIdx) || finished.Contains(entryIdx))
-                        continue;
-
-                    long ts = StreamHeader.ReadTimestamp(entry.AsSpan());
-
-                    if (ts > endTs)
-                    {
-                        finished.Add(entryIdx);
-                        if (finished.Count == indexes.Count)
-                            break;
-                        continue;
-                    }
-
-                    if (ts >= startTs)
-                    {
-                        ushort version = StreamHeader.ReadVersion(entry.AsSpan());
-                        ushort payloadLen = StreamHeader.ReadPayloadLength(entry.AsSpan());
-                        byte[] payload = new byte[payloadLen];
-                        entry.AsSpan(StreamHeader.Size, payloadLen).CopyTo(payload);
-
-                        results[entryIdx].Add(new StreamEntry(ts, entryIdx, version, payload));
-
-                        if (hasLimit && results[entryIdx].Count >= limit)
-                        {
-                            finished.Add(entryIdx);
-                            if (finished.Count == indexes.Count)
-                                break;
-                        }
-                    }
-                }
-
-                return results;
-            }
-
-            /// <summary>
-            /// Scan the shard from <paramref name="fromAddress"/> and collect entries for all secondary indexes
-            /// whose timestamps fall within [startTs, endTs]. Lazily creates result lists.
-            /// </summary>
-            public Dictionary<int, List<StreamEntry>> ScanRangeAllDevices(long fromAddress, long startTs, long endTs, int limit = 0)
-            {
-                Dictionary<int, List<StreamEntry>> results = new Dictionary<int, List<StreamEntry>>();
-                long beginAddr = Math.Max(fromAddress, _log.BeginAddress);
-                long tailAddr = _log.SafeTailAddress;
-
-                if (beginAddr >= tailAddr)
-                    return results;
-
-                HashSet<int> finished = new HashSet<int>();
-                bool hasLimit = limit > 0;
-
-                using FasterLogScanIterator iter = _log.Scan(beginAddr, tailAddr, scanUncommitted: true);
-                while (iter.GetNext(out byte[] entry, out int entryLength, out _))
-                {
-                    if (entryLength < StreamHeader.Size)
-                        continue;
-
-                    int entryIdx = StreamHeader.ReadSecondaryIndex(entry.AsSpan());
-                    if (finished.Contains(entryIdx))
-                        continue;
-
-                    long ts = StreamHeader.ReadTimestamp(entry.AsSpan());
-
-                    if (ts > endTs)
-                    {
-                        finished.Add(entryIdx);
-                        continue;
-                    }
-
-                    if (ts >= startTs)
-                    {
-                        if (!results.ContainsKey(entryIdx))
-                            results[entryIdx] = new List<StreamEntry>();
-
-                        ushort version = StreamHeader.ReadVersion(entry.AsSpan());
-                        ushort payloadLen = StreamHeader.ReadPayloadLength(entry.AsSpan());
-                        byte[] payload = new byte[payloadLen];
-                        entry.AsSpan(StreamHeader.Size, payloadLen).CopyTo(payload);
-
-                        results[entryIdx].Add(new StreamEntry(ts, entryIdx, version, payload));
-
-                        if (hasLimit && results[entryIdx].Count >= limit)
-                        {
-                            finished.Add(entryIdx);
-                        }
-                    }
-                }
-
-                return results;
-            }
-
-            /// <summary>
-            /// Scan the shard and find the first entry for any index in <paramref name="indexes"/>
-            /// whose timestamp is ≥ <paramref name="fromTs"/>. Returns null if none found.
-            /// </summary>
-            public long? FindFirstTimestamp(HashSet<int> indexes, long fromAddress, long fromTs)
-            {
-                long beginAddr = Math.Max(fromAddress, _log.BeginAddress);
-                long tailAddr = _log.SafeTailAddress;
-
-                if (beginAddr >= tailAddr)
-                    return null;
-
-                using FasterLogScanIterator iter = _log.Scan(beginAddr, tailAddr, scanUncommitted: true);
-                while (iter.GetNext(out byte[] entry, out int entryLength, out _))
-                {
-                    if (entryLength < StreamHeader.Size)
-                        continue;
-
-                    int entryIdx = StreamHeader.ReadSecondaryIndex(entry.AsSpan());
-                    if (!indexes.Contains(entryIdx))
-                        continue;
-
-                    long ts = StreamHeader.ReadTimestamp(entry.AsSpan());
-                    if (ts >= fromTs)
-                        return ts;
-                }
-
-                return null;
-            }
-
-            /// <summary>
-            /// Single-pass combination of FindFirstTimestamp and ScanRange. Scans forward, skips
-            /// entries below <paramref name="fromTs"/>, and once the first matching entry is found,
-            /// collects all entries within [firstTs, firstTs + windowMs].
-            /// </summary>
-            public (long? FirstTimestamp, Dictionary<int, List<StreamEntry>> Data) FindAndScanRange(
-                HashSet<int> indexes, long fromAddress, long fromTs, long windowMs, int limit = 0)
-            {
-                Dictionary<int, List<StreamEntry>> results = new Dictionary<int, List<StreamEntry>>(indexes.Count);
-                foreach (int id in indexes)
-                    results[id] = new List<StreamEntry>();
-
-                long beginAddr = Math.Max(fromAddress, _log.BeginAddress);
-                long tailAddr = _log.SafeTailAddress;
-
-                if (beginAddr >= tailAddr)
-                    return (null, results);
-
-                long? firstTs = null;
-                long endTs = long.MaxValue;
-                HashSet<int> finished = new HashSet<int>();
-                bool hasLimit = limit > 0;
-
-                using FasterLogScanIterator iter = _log.Scan(beginAddr, tailAddr, scanUncommitted: true);
-                while (iter.GetNext(out byte[] entry, out int entryLength, out _))
-                {
-                    if (entryLength < StreamHeader.Size)
-                        continue;
-
-                    int entryIdx = StreamHeader.ReadSecondaryIndex(entry.AsSpan());
-                    if (!indexes.Contains(entryIdx) || finished.Contains(entryIdx))
-                        continue;
-
-                    long ts = StreamHeader.ReadTimestamp(entry.AsSpan());
-
-                    if (ts < fromTs)
-                        continue;
-
-                    // First matching entry defines the window
-                    if (!firstTs.HasValue)
-                    {
-                        firstTs = ts;
-                        endTs = ts + windowMs;
-                    }
-
-                    if (ts > endTs)
-                    {
-                        finished.Add(entryIdx);
-                        if (finished.Count == indexes.Count)
-                            break;
-                        continue;
-                    }
-
-                    ushort version = StreamHeader.ReadVersion(entry.AsSpan());
-                    ushort payloadLen = StreamHeader.ReadPayloadLength(entry.AsSpan());
-                    byte[] payload = new byte[payloadLen];
-                    entry.AsSpan(StreamHeader.Size, payloadLen).CopyTo(payload);
-
-                    results[entryIdx].Add(new StreamEntry(ts, entryIdx, version, payload));
-
-                    if (hasLimit && results[entryIdx].Count >= limit)
-                    {
-                        finished.Add(entryIdx);
-                        if (finished.Count == indexes.Count)
-                            break;
-                    }
-                }
-
-                return (firstTs, results);
-            }
-
-            /// <summary>
-            /// Commit all pending writes to disk and wait until the specified address is durable.
-            /// </summary>
-            public ValueTask CommitAndWait(long untilAddress)
-            {
-                _log.Commit(spinWait: false);
-                return _log.WaitForCommitAsync(untilAddress);
-            }
-
-            /// <summary>
-            /// Truncate the log up to the given address, freeing disk space for old entries.
-            /// </summary>
-            public void TruncateUntil(long untilAddress) => _log.TruncateUntil(untilAddress);
-
-            public void Dispose()
-            {
-                _log.Commit(true);
-                _log.Dispose();
-            }
-
-        }
-
     }
 
-    public record class StreamDbStats(long ScaleUp, long ScaleDown, long Dropped, int AdaptiveIdx, long PendingIdxQueueLen);
+    public record class StreamDbStats(long ScaleUp, long ScaleDown, long Dropped, int AdaptiveIdx, long PendingIdxQueueLen, long LateArrivals);
 }

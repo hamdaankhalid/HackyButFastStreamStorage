@@ -20,6 +20,21 @@ Console.WriteLine("StreamDB sample");
 Console.WriteLine($"Data directory: {dataDir}");
 Console.WriteLine();
 
+// ── Core Concepts ──────────────────────────────────────────────────────────────
+//
+// StreamDB uses two index concepts:
+//
+//   PRIMARY INDEX   = Timestamp (long) — used for time-range queries and ordering.
+//                     Every record carries a timestamp as its primary index.
+//
+//   SECONDARY INDEX = An integer grouping key — used for sharding and filtering.
+//                     This can represent anything: a device ID, sensor ID, user ID,
+//                     region code, etc. You choose what the secondary index means
+//                     for your domain.
+//
+// In this sample, we use sensor IDs (1–4) as the secondary index and Unix
+// timestamps as the primary index.
+
 // ── Define a payload struct ────────────────────────────────────────────────────
 
 // StreamDB stores opaque byte payloads with a version tag.
@@ -28,26 +43,34 @@ var registry = new StreamVersionRegistry();
 registry.Register<SensorReading>(version: 1);
 
 // ── Write some data ────────────────────────────────────────────────────────────
+// Each Append call takes:
+//   secondaryIndex — the grouping key (here: sensor ID)
+//   payload        — raw bytes of your struct
+//   timestamp      — the primary index (here: Unix seconds)
+//   version        — schema version for payload evolution
 
 const int sensorCount = 4;
 const int pointsPerSensor = 50;
 long baseTs = DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 3600; // 1 hour ago
 
 Console.WriteLine($"Writing {sensorCount * pointsPerSensor} records across {sensorCount} sensors...");
+Console.WriteLine($"  Primary index:   timestamp (Unix seconds)");
+Console.WriteLine($"  Secondary index: sensor ID (1–{sensorCount})");
+Console.WriteLine();
 
-for (int sensor = 1; sensor <= sensorCount; sensor++)
+for (int sensorId = 1; sensorId <= sensorCount; sensorId++)
 {
     for (int i = 0; i < pointsPerSensor; i++)
     {
         var reading = new SensorReading
         {
-            Temperature = 20.0f + sensor + (i * 0.1f),
+            Temperature = 20.0f + sensorId + (i * 0.1f),
             Humidity = 45.0f + (i * 0.5f),
         };
 
         long ts = baseTs + (i * 60); // one reading per minute
         ReadOnlySpan<byte> payload = MemoryMarshal.AsBytes(new ReadOnlySpan<SensorReading>(in reading));
-        db.Append(secondaryIndex: sensor, payload: payload, timestamp: ts, version: 1);
+        db.Append(secondaryIndex: sensorId, payload: payload, timestamp: ts, version: 1);
     }
 }
 
@@ -55,32 +78,57 @@ for (int sensor = 1; sensor <= sensorCount; sensor++)
 db.WaitForPendingWrites();
 Console.WriteLine("Done writing.\n");
 
-// ── Read a range for one sensor ────────────────────────────────────────────────
+// ── Late arrivals (out-of-order writes) ────────────────────────────────────────
+// StreamDB handles occasional out-of-order timestamps transparently.
+// Late arrivals go to a SQLite side store and are merged into reads automatically.
 
-long queryStart = baseTs + (10 * 60); // skip first 10 minutes
-long queryEnd = baseTs + (20 * 60);   // 10-minute window
+Console.WriteLine("── Late arrivals demo ──");
+Console.WriteLine("Writing 3 out-of-order entries for sensor 1 (timestamps in the past)...");
 
-Console.WriteLine($"── Single-sensor read (sensor 1, 10 min window) ──");
+for (int i = 0; i < 3; i++)
+{
+    var lateReading = new SensorReading
+    {
+        Temperature = 99.0f + i,
+        Humidity = 99.0f,
+    };
+    // These timestamps are before the max seen timestamp for sensor 1
+    long lateTs = baseTs + (5 * 60) + (i * 60); // minutes 5, 6, 7
+    ReadOnlySpan<byte> latePayload = MemoryMarshal.AsBytes(new ReadOnlySpan<SensorReading>(in lateReading));
+    db.Append(secondaryIndex: 1, payload: latePayload, timestamp: lateTs, version: 1);
+}
+Console.WriteLine("Late arrivals written.\n");
+
+// ── Read a time range for one secondary index ──────────────────────────────────
+// Query by primary index (timestamp range) filtered to a single secondary index.
+// This range includes both normal entries AND the late arrivals we just wrote.
+
+long queryStart = baseTs + (5 * 60); // start from minute 5 (where late arrivals begin)
+long queryEnd = baseTs + (20 * 60);   // through minute 20
+
+Console.WriteLine($"── Single-index read (sensor 1, minutes 5–20) ──");
+Console.WriteLine($"(includes 3 late arrivals merged in timestamp order)");
 List<StreamEntry> entries = db.ReadRange(secondaryIndex: 1, startTs: queryStart, endTs: queryEnd);
 Console.WriteLine($"Got {entries.Count} entries:");
 foreach (StreamEntry e in entries)
 {
     SensorReading r = registry.Deserialize<SensorReading>(e);
-    Console.WriteLine($"  ts={e.Timestamp}  temp={r.Temperature:F1}°C  humidity={r.Humidity:F1}%");
+    Console.WriteLine($"  ts={e.Timestamp} (primary)  sensor={e.SecondaryIndex} (secondary)  temp={r.Temperature:F1}°C  humidity={r.Humidity:F1}%");
 }
 Console.WriteLine();
 
-// ── Multi-sensor read ──────────────────────────────────────────────────────────
+// ── Read across multiple secondary indexes ─────────────────────────────────────
+// Query the same time range across several secondary indexes in one optimized scan.
 
-Console.WriteLine($"── Multi-sensor read (sensors 1-3, same window) ──");
+Console.WriteLine($"── Multi-index read (sensors 1-3, same window) ──");
 Dictionary<int, List<StreamEntry>> multi = db.ReadRange(
     secondaryIndexes: new[] { 1, 2, 3 },
     startTs: queryStart,
     endTs: queryEnd
 );
-foreach ((int sensor, List<StreamEntry> sensorEntries) in multi)
+foreach ((int secondaryIndex, List<StreamEntry> sensorEntries) in multi)
 {
-    Console.WriteLine($"  Sensor {sensor}: {sensorEntries.Count} entries");
+    Console.WriteLine($"  Secondary index {secondaryIndex}: {sensorEntries.Count} entries");
 }
 Console.WriteLine();
 
@@ -88,11 +136,12 @@ Console.WriteLine();
 
 StreamDbStats stats = db.GetStats();
 Console.WriteLine($"── Stats ──");
-Console.WriteLine($"  Scale up:   {stats.ScaleUp}");
-Console.WriteLine($"  Scale down: {stats.ScaleDown}");
-Console.WriteLine($"  Dropped:    {stats.Dropped}");
-Console.WriteLine($"  Adaptive:   {stats.AdaptiveIdx}");
-Console.WriteLine($"  Pending:    {stats.PendingIdxQueueLen}");
+Console.WriteLine($"  Scale up:      {stats.ScaleUp}");
+Console.WriteLine($"  Scale down:    {stats.ScaleDown}");
+Console.WriteLine($"  Dropped:       {stats.Dropped}");
+Console.WriteLine($"  Adaptive:      {stats.AdaptiveIdx}");
+Console.WriteLine($"  Pending:       {stats.PendingIdxQueueLen}");
+Console.WriteLine($"  Late arrivals: {stats.LateArrivals}");
 Console.WriteLine();
 
 // ── Cleanup ────────────────────────────────────────────────────────────────────

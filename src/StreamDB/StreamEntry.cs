@@ -58,7 +58,7 @@ namespace StreamDB
     public readonly record struct StreamEntry(
         /// <summary>Primary index — timestamp/score used for range queries and ordering.</summary>
         long Timestamp,
-        /// <summary>Secondary index — used for sharding and filtering (e.g., device ID).</summary>
+        /// <summary>Secondary index — used for sharding and filtering (e.g., device ID, sensor ID, user ID).</summary>
         int SecondaryIndex,
         /// <summary>Schema version of the payload, enabling format evolution.</summary>
         ushort Version,

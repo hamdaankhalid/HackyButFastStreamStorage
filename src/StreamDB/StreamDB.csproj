@@ -6,7 +6,7 @@
     <Nullable>enable</Nullable>
     <RootNamespace>StreamDB</RootNamespace>
     <Description>High-throughput schema-on-read stream storage engine for time-series data, built on FASTER and SQLite.</Description>
-    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
   </PropertyGroup>
 
   <ItemGroup>

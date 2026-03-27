@@ -19,7 +19,7 @@ namespace StreamDB
     ///
     /// Deserializing entries:
     /// <code>
-    /// List&lt;StreamEntry&gt; entries = streamDb.ReadRange(deviceId, startTs, endTs);
+    /// List&lt;StreamEntry&gt; entries = streamDb.ReadRange(secondaryIndex, startTs, endTs);
     /// foreach (var entry in entries)
     /// {
     ///     if (registry.CanDeserialize&lt;GpsPayloadV2&gt;(entry))

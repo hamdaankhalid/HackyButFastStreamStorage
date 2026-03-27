@@ -1,10 +1,21 @@
 # StreamDB
 
-A high-throughput, schema-on-read stream storage engine for time-series data. Built on [Microsoft FASTER](https://github.com/microsoft/FASTER) and SQLite.
+A schema-on-read embedded stream storage engine for time-series data. Built on [Microsoft FASTER](https://github.com/microsoft/FASTER) and SQLite.
 
 ## What is StreamDB?
 
 StreamDB is purpose-built for workloads where data arrives fast and needs to be queryable by time range — think IoT telemetry, sensor data, event logs, or any append-heavy stream. It pairs FASTER's append-only log for raw throughput with a sparse SQLite index for efficient lookups, giving you the best of both worlds: lock-free writes and bounded-scan reads.
+
+### Data Model: Primary & Secondary Indexes
+
+Every record in StreamDB is organized around two index concepts:
+
+| Concept | Type | Purpose |
+|---------|------|---------|
+| **Primary Index** | `long` (timestamp) | Time-range queries and ordering. Every record carries a timestamp as its primary index. |
+| **Secondary Index** | `int` (grouping key) | Sharding and filtering. Represents any logical grouping — device ID, sensor ID, user ID, region, etc. |
+
+The primary index (timestamp) determines **when** something happened. The secondary index determines **who/what** produced it. Together they enable efficient queries like "give me all readings from sensor 42 between 1pm and 2pm."
 
 ### Key Properties
 
@@ -27,15 +38,15 @@ var db = new StreamDB.StreamDB(
     logger: logger
 );
 
-// Write (non-blocking, lock-free)
-db.Append(secondaryIndex: deviceId, payload: bytes, timestamp: ts, version: 1);
+// Write — timestamp is the primary index, secondaryIndex is the grouping key
+db.Append(secondaryIndex: sensorId, payload: bytes, timestamp: ts, version: 1);
 
-// Read a time range for one device
-List<StreamEntry> entries = db.ReadRange(deviceId, startTs, endTs);
+// Read a time range for one secondary index
+List<StreamEntry> entries = db.ReadRange(secondaryIndex: sensorId, startTs: startTs, endTs: endTs);
 
-// Read across multiple devices (single scan per shard)
+// Read across multiple secondary indexes (single scan per shard)
 Dictionary<int, List<StreamEntry>> multi = db.ReadRange(
-    new[] { device1, device2, device3 }, startTs, endTs
+    secondaryIndexes: new[] { sensor1, sensor2, sensor3 }, startTs: startTs, endTs: endTs
 );
 
 // Monitor health
@@ -48,11 +59,13 @@ StreamDbStats stats = db.GetStats();
 StreamDB.sln
 ├── src/StreamDB/              # Class library
 │   ├── StreamDB.cs            # Core storage engine
+│   ├── LogShard.cs            # FasterLog shard wrapper
+│   ├── LateArrivalsStore.cs   # Out-of-order write side store
 │   ├── StreamEntry.cs         # Record header layout and entry struct
 │   ├── StreamVersionRegistry.cs # Payload versioning utility
 │   └── PooledConnection.cs    # SQLite connection pool
 ├── samples/StreamDB.Sample/   # Console app demo
-│   └── Program.cs             # Write + read + stats example
+│   └── Program.cs             # Write + read + late arrivals + stats example
 ├── docs/
 │   └── architecture.md        # Full technical documentation
 └── LICENSE
@@ -77,5 +90,5 @@ See the [`docs/`](docs/) directory for detailed technical documentation:
 
 ## License
 
-[MIT](LICENSE)
+[Apache 2.0](LICENSE)
 

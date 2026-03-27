@@ -1,10 +1,10 @@
 # StreamDB
 
-High-performance sharded time-series storage for device telemetry with sparse indexing and adaptive batching.
+High-performance sharded time-series storage with sparse indexing and adaptive batching.
 
 ## Overview
 
-StreamDB is a specialized storage engine designed for high-throughput device telemetry ingestion with efficient time-range queries. It combines FasterLog's append-only log with SQLite sparse indexing to achieve:
+StreamDB is a specialized storage engine designed for high-throughput stream ingestion with efficient time-range queries. It combines FasterLog's append-only log with SQLite sparse indexing to achieve:
 
 - **Non-blocking writes**: <100μs latency, never waits for index updates
 - **Efficient range queries**: O(log N) index lookup + bounded scan
@@ -19,7 +19,7 @@ StreamDB is a specialized storage engine designed for high-throughput device tel
 ┌─────────────┐
 │   Clients   │  (ASP.NET request threads)
 └──────┬──────┘
-       │ Append(deviceId, item, timestamp)
+       │ Append(secondaryIndex, payload, timestamp)
        ▼
 ┌─────────────────────────────────────────────────────────┐
 │                      StreamDB                           │
@@ -42,8 +42,8 @@ StreamDB is a specialized storage engine designed for high-throughput device tel
 │                       ▼                                 │
 │              ┌─────────────────┐                        │
 │              │ SQLite Index DB │                        │
-│              │ (device, ts) →  │                        │
-│              │   log_address   │                        │
+│              │ (secondary_index, │                        │
+│              │  ts) → log_addr   │                        │
 │              └─────────────────┘                        │
 └─────────────────────────────────────────────────────────┘
 ```
@@ -52,7 +52,7 @@ StreamDB is a specialized storage engine designed for high-throughput device tel
 
 Records are distributed across 4 FasterLog shards using: `secondaryIndex & 0x3`
 
-This reduces file handles and enables parallel I/O while maintaining per-device write ordering.
+This reduces file handles and enables parallel I/O while maintaining per-secondary-index write ordering.
 
 ## Record Format
 
@@ -67,7 +67,7 @@ Each record stored in FasterLog has a 16-byte header followed by a variable-leng
 ```
 
 - **Timestamp** (primary index): Used for range queries and ordering
-- **Secondary Index**: Used for sharding and filtering (e.g., device ID)
+- **Secondary Index**: Used for sharding and filtering (e.g., device ID, sensor ID, user ID)
 - **Version**: Schema version for payload format evolution
 - **Payload**: Opaque bytes — StreamDB never interprets these
 
@@ -92,7 +92,7 @@ var payload = new GpsPayload { Lat = 37.77, Long = -122.42, Accuracy = 5.0f, Spe
 
 // Append with header fields + raw payload bytes
 streamDb.Append(
-    secondaryIndex: deviceId,
+    secondaryIndex: sensorId,
     payload: MemoryMarshal.AsBytes(new ReadOnlySpan<GpsPayload>(in payload)),
     timestamp: DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
     version: StreamVersions.GpsV1
@@ -100,15 +100,17 @@ streamDb.Append(
 ```
 
 **Constraints:**
-- Timestamps must be monotonically increasing per secondary index
 - Writes are serialized per secondary index (upstream responsibility)
+- Monotonically increasing timestamps are optimal but **not required** — out-of-order
+  (late-arriving) writes are automatically routed to a SQLite side store and merged
+  into reads transparently
 
 ### Reading Data
 
-**Single device:**
+**Single secondary index:**
 ```csharp
 List<StreamEntry> data = streamDb.ReadRange(
-    secondaryIndex: deviceId,
+    secondaryIndex: sensorId,
     startTs: startTime,
     endTs: endTime,
     limit: 1000  // 0 = unlimited
@@ -118,11 +120,11 @@ List<StreamEntry> data = streamDb.ReadRange(
 foreach (var entry in data)
 {
     var gps = MemoryMarshal.Read<GpsPayload>(entry.Payload);
-    Console.WriteLine($"Device {entry.SecondaryIndex} at {entry.Timestamp}: ({gps.Lat}, {gps.Long})");
+    Console.WriteLine($"SecondaryIndex {entry.SecondaryIndex} at {entry.Timestamp}: ({gps.Lat}, {gps.Long})");
 }
 ```
 
-**Multiple devices (optimized):**
+**Multiple secondary indexes (optimized):**
 ```csharp
 Dictionary<int, List<StreamEntry>> data = streamDb.ReadRange(
     secondaryIndexes: new[] { 1234, 5678, 9012 },
@@ -132,7 +134,7 @@ Dictionary<int, List<StreamEntry>> data = streamDb.ReadRange(
 );
 ```
 
-**All devices:**
+**All secondary indexes:**
 ```csharp
 Dictionary<int, List<StreamEntry>> data = streamDb.ReadRange(
     startTs: startTime,
@@ -182,13 +184,33 @@ Console.WriteLine($"Queue Depth: {stats.PendingIdxQueueLen}");
 
 **Hysteresis:** Requires 5 batches between adjustments to prevent oscillation.
 
+### Late Arrivals (Out-of-Order Writes)
+
+StreamDB is optimized for monotonically increasing timestamps, but handles occasional
+out-of-order writes transparently via a **late arrivals side store**:
+
+```
+Normal write (ts ≥ maxTs):  → FasterLog (lock-free, fast)
+Late arrival (ts < maxTs):  → SQLite late_arrivals table (synchronous, correct)
+```
+
+- On `Append`: tracks `maxTimestamp` per secondary index. If the incoming timestamp is
+  lower than the max seen, the entry is stored in a `late_arrivals` SQLite table instead of FasterLog.
+- On `ReadRange`: merges FasterLog scan results with a `late_arrivals` query, producing
+  a correctly-ordered result transparently.
+- On retention: `late_arrivals` entries older than the retention cutoff are purged alongside
+  the sparse index.
+
+**Performance impact:** Zero for the monotonic (normal) path. Late arrivals incur a synchronous
+SQLite write, which is acceptable for infrequent out-of-order data.
+
 ## Read Path Details
 
 ### 1. SQLite Index Lookup
 ```sql
 SELECT log_address 
 FROM stream_index 
-WHERE device_id = ? AND timestamp <= ?
+WHERE secondary_index = ? AND timestamp <= ?
 ORDER BY timestamp DESC 
 LIMIT 1
 ```
@@ -196,13 +218,18 @@ Returns the nearest indexed address ≤ startTs (or 0 if none exists).
 
 ### 2. FasterLog Scan
 - **Start from indexed address**: Bounded scan distance
-- **Filter by deviceId**: Fast path without full deserialization
+- **Filter by secondary index**: Fast path without full deserialization
 - **Filter by timestamp**: [startTs, endTs]
-- **Stop early**: When timestamp > endTs (safe due to monotonicity)
+- **Stop early**: When timestamp > endTs (safe for monotonic data)
 
-### Multi-Device Optimization
-- Groups devices by shard
-- Finds MIN(address) per shard across all devices
+### 3. Late Arrivals Merge
+- Query the `late_arrivals` SQLite table for the same secondary index(es) and time range
+- Merge results with the FasterLog scan results, sorted by timestamp
+- Transparent to the caller — `ReadRange` always returns the complete, correctly-ordered result
+
+### Multi-Index Optimization
+- Groups secondary indexes by shard
+- Finds MIN(address) per shard across all indexes
 - Single scan per shard (instead of N scans)
 
 ## Background Maintenance
@@ -259,7 +286,7 @@ Returns the nearest indexed address ≤ startTs (or 0 if none exists).
 
 ### Guarantees
 
-✅ **Per-device monotonicity**: Timestamps strictly increase  
+✅ **Per-index monotonicity**: Timestamps strictly increase per secondary index in FasterLog; out-of-order writes go to side store  
 ✅ **Non-blocking writes**: FasterLog append never waits  
 ✅ **Durability before indexing**: Log committed before SQLite insert  
 ✅ **No deadlocks**: Lock hierarchy enforced  
@@ -295,14 +322,14 @@ For each shard:
 - **Batching**: Amortizes SQLite overhead across entries
 
 ### Read Performance
-- **Index lookup**: O(log N) where N = indexed entries per device
+- **Index lookup**: O(log N) where N = indexed entries per secondary index
 - **Scan distance**: O(M) where M = entries between index points
 - **Typical M**: 16-4096 entries (adaptive)
-- **Multi-device**: Single scan per shard (efficient)
+- **Multi-index**: Single scan per shard (efficient)
 
 ### Storage
 - **FasterLog**: Append-only, 4KB page size
-- **SQLite**: WITHOUT ROWID, primary key (device_id, timestamp)
+- **SQLite**: WITHOUT ROWID, primary key (secondary_index, timestamp); plus `late_arrivals` table for out-of-order entries
 - **Index density**: 1 entry per 16-4096 writes (adaptive)
 
 ### Memory
@@ -343,14 +370,14 @@ QueueLowWaterMark = 512;    // 25% - trigger scale down
 ## Best Practices
 
 ### ✅ Do
-- Maintain per-device monotonic timestamps
-- Serialize writes per device (upstream)
+- Maintain per-secondary-index monotonic timestamps when possible (optimal performance)
+- Serialize writes per secondary index (upstream)
 - Monitor `GetStats()` for health
-- Use multi-device overload for batch queries
+- Use multi-index overload for batch queries
 - Set appropriate retention periods
 
 ### ❌ Don't
-- Write out-of-order timestamps for same device
+- Rely on frequent out-of-order writes (side store is for occasional late arrivals, not a primary write path)
 - Call `WaitForPendingWrites()` in production (testing only)
 - Set very short checkpoint intervals (<10 minutes)
 - Use small shard counts on high write volumes
@@ -404,26 +431,25 @@ QueueLowWaterMark = 512;    // 25% - trigger scale down
 
 ## Type Requirements
 
-### TDeviceId
-- Must be `unmanaged`
-- Supported: `ushort`, `uint`
-- Located at offset 0 in telemetry struct
+### Secondary Index
+- Type: `int`
+- Represents any logical grouping key (device ID, sensor ID, user ID, region code, etc.)
+- Used for shard assignment via `secondaryIndex & ShardMask`
 
-### T (Telemetry)
+### T (Payload)
 - Must be `unmanaged` (value type, no references)
 - Fixed size
-- Contains device ID at offset 0
+- StreamDB stores it as opaque bytes — you define and deserialize it
 
 Example:
 ```csharp
 [StructLayout(LayoutKind.Sequential)]
-public struct TelemetryData
+public struct SensorReading
 {
-    public ushort DeviceId;  // Must be first field
-    public long Timestamp;
+    public float Temperature;
+    public float Humidity;
     public float Latitude;
     public float Longitude;
-    // ... other fields
 }
 ```
 
@@ -461,4 +487,4 @@ Cleanup sequence:
 
 ## License
 
-Part of the HopShip project.
+Licensed under the Apache License, Version 2.0. See [LICENSE](../LICENSE) for details.

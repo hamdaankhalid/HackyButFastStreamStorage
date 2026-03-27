@@ -5,4 +5,10 @@
   <Folder Name="/src/">
     <Project Path="src/StreamDB/StreamDB.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/StreamDB.Tests/StreamDB.Tests.csproj" />
+  </Folder>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/StreamDB.Benchmarks/StreamDB.Benchmarks.csproj" />
+  </Folder>
 </Solution>
