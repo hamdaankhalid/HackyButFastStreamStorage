@@ -518,19 +518,69 @@ namespace StreamDB
         /// for each matching entry with a <see cref="StreamEntryView"/> whose payload references
         /// FasterLog's internal buffer — no <c>byte[]</c> is allocated per entry.
         ///
-        /// The handler must process or copy the payload inline; it is invalid after the callback returns.
+        /// Late arrivals are merged in primary index order. The handler must process or copy the
+        /// payload inline; it is invalid after the callback returns.
         /// Return <c>false</c> from the handler to stop scanning early.
-        ///
-        /// <b>Note:</b> Late arrivals are not included in pooled scans. If you need late arrivals,
-        /// use <see cref="ReadRange(int, long, long, int)"/> instead.
         /// </summary>
         public void ReadRangePooled(int secondaryIndex, long startPrimaryIndex, long endPrimaryIndex, StreamEntryHandler handler)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
 
+            // Pre-fetch late arrivals (if any) so we can merge them in order during the scan
+            List<StreamEntry>? lateEntries = null;
+            if (Volatile.Read(ref _lateArrivalCount) > 0)
+            {
+                var late = _lateArrivals.QueryRange(secondaryIndex, startPrimaryIndex, endPrimaryIndex);
+                if (late.Count > 0)
+                    lateEntries = late;
+            }
+
             long scanFrom = LookupNearestAddress(secondaryIndex, startPrimaryIndex);
             LogShard shard = GetShard(secondaryIndex);
-            shard.ScanRange(secondaryIndex, scanFrom, startPrimaryIndex, endPrimaryIndex, handler);
+
+            if (lateEntries == null)
+            {
+                // Fast path: no late arrivals, pure zero-allocation scan
+                shard.ScanRange(secondaryIndex, scanFrom, startPrimaryIndex, endPrimaryIndex, handler);
+                return;
+            }
+
+            // Merge path: interleave FasterLog scan with pre-fetched late arrivals in primary index order
+            int lateIdx = 0;
+            shard.ScanRange(secondaryIndex, scanFrom, startPrimaryIndex, endPrimaryIndex,
+                (in StreamEntryView logEntry) =>
+                {
+                    // Emit any late arrivals that come before this log entry
+                    while (lateIdx < lateEntries.Count && lateEntries[lateIdx].PrimaryIndex <= logEntry.PrimaryIndex)
+                    {
+                        StreamEntry le = lateEntries[lateIdx++];
+                        var lateView = new StreamEntryView
+                        {
+                            PrimaryIndex = le.PrimaryIndex,
+                            SecondaryIndex = le.SecondaryIndex,
+                            Version = le.Version,
+                            Payload = le.Payload
+                        };
+                        if (!handler(in lateView))
+                            return false;
+                    }
+                    return handler(in logEntry);
+                });
+
+            // Emit remaining late arrivals that come after all log entries
+            while (lateIdx < lateEntries.Count)
+            {
+                StreamEntry le = lateEntries[lateIdx++];
+                var lateView = new StreamEntryView
+                {
+                    PrimaryIndex = le.PrimaryIndex,
+                    SecondaryIndex = le.SecondaryIndex,
+                    Version = le.Version,
+                    Payload = le.Payload
+                };
+                if (!handler(in lateView))
+                    break;
+            }
         }
 
         /// <summary>

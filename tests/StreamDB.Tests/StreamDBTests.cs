@@ -329,6 +329,28 @@ public class StreamDBBasicTests
 
         Assert.That(capturedValue, Is.EqualTo(77.7f).Within(0.01f));
     }
+
+    [Test]
+    public void ReadRangePooled_IncludesLateArrivals()
+    {
+        AppendPayload(1, 100);
+        AppendPayload(1, 200);
+        AppendPayload(1, 300);
+        AppendPayload(1, 150); // late arrival
+        _db.WaitForPendingWrites();
+
+        var primaryIndexes = new List<long>();
+        _db.ReadRangePooled(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 300,
+            (in StreamEntryView entry) =>
+            {
+                primaryIndexes.Add(entry.PrimaryIndex);
+                return true;
+            });
+
+        Assert.That(primaryIndexes, Has.Count.EqualTo(4));
+        // Should be in primary index order with late arrival merged in
+        Assert.That(primaryIndexes, Is.EqualTo(new long[] { 100, 150, 200, 300 }));
+    }
 }
 
 [TestFixture]
