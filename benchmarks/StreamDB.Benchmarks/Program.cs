@@ -15,8 +15,6 @@
 using System.Runtime.InteropServices;
 using BenchmarkDotNet.Attributes;
 using BenchmarkDotNet.Running;
-using BenchmarkDotNet.Configs;
-using BenchmarkDotNet.Jobs;
 using Microsoft.Data.Sqlite;
 using RocksDbSharp;
 
@@ -32,7 +30,7 @@ public struct BenchPayload
 }
 
 [MemoryDiagnoser]
-[SimpleJob(RuntimeMoniker.Net90, iterationCount: 3, warmupCount: 1)]
+[SimpleJob(iterationCount: 3, warmupCount: 1)]
 public class WriteBenchmarks
 {
     private string _streamDbDir = null!;
@@ -170,7 +168,7 @@ public class WriteBenchmarks
 }
 
 [MemoryDiagnoser]
-[SimpleJob(RuntimeMoniker.Net90, iterationCount: 3, warmupCount: 1)]
+[SimpleJob(iterationCount: 3, warmupCount: 1)]
 public class ReadBenchmarks
 {
     private string _streamDbDir = null!;

@@ -273,9 +273,10 @@ Returns the nearest indexed address ≤ startPrimaryIndex (or 0 if none exists).
 | Operation | Lock Type | Concurrency |
 |-----------|-----------|-------------|
 | Append (FasterLog) | Lock-free | Fully concurrent |
+| Append (late arrival) | Read lock | Blocked during checkpoint |
 | Enqueue index | Lock-free (ConcurrentQueue) | Fully concurrent |
-| Index write (FlushWorker) | Read lock | Allows concurrent writes |
-| Checkpoint | Write lock | Blocks index writes only |
+| Index write (FlushWorker) | Read lock | Blocked during checkpoint |
+| Checkpoint | Write lock | Blocks all SQLite writers |
 | Retention | Maintenance lock | Exclusive with checkpoint |
 
 ### Thread Model
@@ -287,7 +288,7 @@ Returns the nearest indexed address ≤ startPrimaryIndex (or 0 if none exists).
 ### Guarantees
 
 ✅ **Per-index monotonicity**: Primary indexes strictly increase per secondary index in FasterLog; out-of-order writes go to side store  
-✅ **Non-blocking writes**: FasterLog append never waits  
+✅ **Non-blocking writes**: FasterLog append never waits; late arrival writes may briefly block during checkpoint (~100-500ms, hourly)  
 ✅ **Durability before indexing**: Log committed before SQLite insert  
 ✅ **No deadlocks**: Lock hierarchy enforced  
 ✅ **Graceful degradation**: Drops index entries when overwhelmed  

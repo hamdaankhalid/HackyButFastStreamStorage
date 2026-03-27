@@ -4,3 +4,4 @@ obj/
 *.suo
 .vs/
 *.DS_Store
+BenchmarkDotNet.Artifacts/
