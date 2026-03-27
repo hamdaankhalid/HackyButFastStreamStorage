@@ -193,6 +193,7 @@ out-of-order writes transparently via a **three-way routing** mechanism:
 Normal write (pi ≥ maxPi):                      → FasterLog (lock-free, fast)
 Jitter write (pi ≥ maxPi - jitterWindow):        → FasterLog (fast path, no SQLite)
 Late arrival (pi < maxPi - jitterWindow):         → SQLite late_arrivals table (synchronous, correct)
+Late arrival below retention floor:               → DROPPED (data already purged)
 ```
 
 The **jitter window** allows writes that are slightly out of order (within a configurable
@@ -216,6 +217,13 @@ var db = new StreamDB(jitterWindow: 120); // tolerate 120 units of out-of-order
   Late arrivals from SQLite are merged as before.
 - On retention: `late_arrivals` entries older than the retention cutoff are purged alongside
   the sparse index.
+
+**Retention floor:** After each retention run, a floor is set at the retention cutoff.
+Any late arrival whose primary index falls below this floor is **silently dropped** —
+the FasterLog data and sparse index for that range have already been truncated,
+so accepting the write would create an orphaned side-store entry with no corresponding
+log data. This effectively means: **you cannot insert data older than the retention period.**
+The `DroppedLateArrivals` stat tracks these drops.
 
 **Performance impact:** Zero for the monotonic (normal) path. Jitter-absorbed writes are as
 fast as normal writes (no SQLite). Late arrivals beyond the jitter window incur a synchronous

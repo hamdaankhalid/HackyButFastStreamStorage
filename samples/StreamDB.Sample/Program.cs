@@ -174,6 +174,7 @@ Console.WriteLine($"  Adaptive:         {stats.AdaptiveIdx}");
 Console.WriteLine($"  Pending:          {stats.PendingIdxQueueLen}");
 Console.WriteLine($"  Late arrivals:    {stats.LateArrivals}");
 Console.WriteLine($"  Jitter absorbed:  {stats.JitterAbsorbed}");
+Console.WriteLine($"  Dropped (stale):  {stats.DroppedLateArrivals}");
 Console.WriteLine();
 
 // ── Cleanup ────────────────────────────────────────────────────────────────────

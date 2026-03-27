@@ -114,6 +114,12 @@ namespace StreamDB
         private readonly ConcurrentDictionary<int, long> _maxPrimaryIndexes = new();
         private readonly LateArrivalsStore _lateArrivals;
         private long _lateArrivalCount = 0;
+        private long _droppedLateArrivals = 0;
+
+        // Retention floor: the primary index cutoff from the last retention run.
+        // Late arrivals with primaryIndex below this floor are dropped — the data they
+        // would reference has already been purged from the log and sparse index.
+        private long _retentionFloor = 0;
 
         // Jitter window: tolerate slightly out-of-order writes in FasterLog
         private readonly long _jitterWindow;
@@ -414,7 +420,15 @@ namespace StreamDB
                 }
                 else
                 {
-                    // Beyond jitter window — route to side store
+                    // Beyond jitter window — check retention floor before routing to side store
+                    long floor = Volatile.Read(ref _retentionFloor);
+                    if (primaryIndex < floor)
+                    {
+                        // Below retention floor — data for this range has been purged, drop silently
+                        Interlocked.Increment(ref _droppedLateArrivals);
+                        return;
+                    }
+
                     Interlocked.Increment(ref _lateArrivalCount);
                     // Acquire read lock so late arrival writes are blocked during checkpoint (write lock)
                     _indexWriteLock.EnterReadLock();
@@ -494,7 +508,8 @@ namespace StreamDB
                 Volatile.Read(ref _adaptiveIdx),
                 Volatile.Read(ref _pendingIndexCount),
                 Volatile.Read(ref _lateArrivalCount),
-                Volatile.Read(ref _jitterAbsorbedCount)
+                Volatile.Read(ref _jitterAbsorbedCount),
+                Volatile.Read(ref _droppedLateArrivals)
             );
 
         #endregion
@@ -992,6 +1007,12 @@ namespace StreamDB
                 _logger?.LogInformation("RunRetention: starting retention");
 
                 long cutoffPi = DateTimeOffset.UtcNow.ToUnixTimeSeconds() - (long)_retentionPeriod.TotalSeconds;
+
+                // Set the retention floor BEFORE purging — any late arrival arriving after this
+                // point with primaryIndex < cutoffPi will be dropped rather than stored in a
+                // table whose corresponding log data is being deleted.
+                Volatile.Write(ref _retentionFloor, cutoffPi);
+
                 PurgeIndexBefore(cutoffPi);
                 long remainingLateArrivals = _lateArrivals.PurgeBefore(cutoffPi);
                 if (remainingLateArrivals == 0)
@@ -1200,5 +1221,5 @@ namespace StreamDB
 
     }
 
-    public record class StreamDbStats(long ScaleUp, long ScaleDown, long Dropped, int AdaptiveIdx, long PendingIdxQueueLen, long LateArrivals, long JitterAbsorbed);
+    public record class StreamDbStats(long ScaleUp, long ScaleDown, long Dropped, int AdaptiveIdx, long PendingIdxQueueLen, long LateArrivals, long JitterAbsorbed, long DroppedLateArrivals);
 }
