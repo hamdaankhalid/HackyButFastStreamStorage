@@ -61,12 +61,51 @@ namespace StreamDB
         }
 
         /// <summary>
-        /// Single-index scan. Delegates to the multi-index overload.
+        /// Single-index scan. Optimized path that avoids HashSet/Dictionary allocation.
         /// </summary>
         public List<StreamEntry> ScanRange(int secondaryIndex, long fromAddress, long startPrimaryIndex, long endPrimaryIndex, int limit = 0)
         {
-            Dictionary<int, List<StreamEntry>> results = ScanRange(new HashSet<int>(1) { secondaryIndex }, fromAddress, startPrimaryIndex, endPrimaryIndex, limit);
-            return results[secondaryIndex];
+            var results = new List<StreamEntry>();
+
+            long beginAddr = Math.Max(fromAddress, _log.BeginAddress);
+            long tailAddr = _log.SafeTailAddress;
+
+            if (beginAddr >= tailAddr)
+                return results;
+
+            bool hasLimit = limit > 0;
+
+            using FasterLogScanIterator iter = _log.Scan(beginAddr, tailAddr, scanUncommitted: true);
+            while (iter.GetNext(out byte[] entry, out int entryLength, out _))
+            {
+                if (entryLength < StreamHeader.Size)
+                    continue;
+
+                ReadOnlySpan<byte> header = entry.AsSpan();
+                int entryIdx = StreamHeader.ReadSecondaryIndex(header);
+                if (entryIdx != secondaryIndex)
+                    continue;
+
+                long pi = StreamHeader.ReadPrimaryIndex(header);
+
+                if (pi > endPrimaryIndex)
+                    break;
+
+                if (pi >= startPrimaryIndex)
+                {
+                    ushort version = StreamHeader.ReadVersion(header);
+                    ushort payloadLen = StreamHeader.ReadPayloadLength(header);
+                    byte[] payload = new byte[payloadLen];
+                    entry.AsSpan(StreamHeader.Size, payloadLen).CopyTo(payload);
+
+                    results.Add(new StreamEntry(pi, entryIdx, version, payload));
+
+                    if (hasLimit && results.Count >= limit)
+                        break;
+                }
+            }
+
+            return results;
         }
 
         /// <summary>
@@ -95,12 +134,14 @@ namespace StreamDB
                 if (entryLength < StreamHeader.Size)
                     continue;
 
+                ReadOnlySpan<byte> header = entry.AsSpan();
+
                 // Read secondary index from header for fast-path filtering
-                int entryIdx = StreamHeader.ReadSecondaryIndex(entry.AsSpan());
+                int entryIdx = StreamHeader.ReadSecondaryIndex(header);
                 if (!indexes.Contains(entryIdx) || finished.Contains(entryIdx))
                     continue;
 
-                long pi = StreamHeader.ReadPrimaryIndex(entry.AsSpan());
+                long pi = StreamHeader.ReadPrimaryIndex(header);
 
                 if (pi > endPrimaryIndex)
                 {
@@ -112,8 +153,8 @@ namespace StreamDB
 
                 if (pi >= startPrimaryIndex)
                 {
-                    ushort version = StreamHeader.ReadVersion(entry.AsSpan());
-                    ushort payloadLen = StreamHeader.ReadPayloadLength(entry.AsSpan());
+                    ushort version = StreamHeader.ReadVersion(header);
+                    ushort payloadLen = StreamHeader.ReadPayloadLength(header);
                     byte[] payload = new byte[payloadLen];
                     entry.AsSpan(StreamHeader.Size, payloadLen).CopyTo(payload);
 
@@ -153,11 +194,12 @@ namespace StreamDB
                 if (entryLength < StreamHeader.Size)
                     continue;
 
-                int entryIdx = StreamHeader.ReadSecondaryIndex(entry.AsSpan());
+                ReadOnlySpan<byte> header = entry.AsSpan();
+                int entryIdx = StreamHeader.ReadSecondaryIndex(header);
                 if (finished.Contains(entryIdx))
                     continue;
 
-                long pi = StreamHeader.ReadPrimaryIndex(entry.AsSpan());
+                long pi = StreamHeader.ReadPrimaryIndex(header);
 
                 if (pi > endPrimaryIndex)
                 {
@@ -170,8 +212,8 @@ namespace StreamDB
                     if (!results.ContainsKey(entryIdx))
                         results[entryIdx] = new List<StreamEntry>();
 
-                    ushort version = StreamHeader.ReadVersion(entry.AsSpan());
-                    ushort payloadLen = StreamHeader.ReadPayloadLength(entry.AsSpan());
+                    ushort version = StreamHeader.ReadVersion(header);
+                    ushort payloadLen = StreamHeader.ReadPayloadLength(header);
                     byte[] payload = new byte[payloadLen];
                     entry.AsSpan(StreamHeader.Size, payloadLen).CopyTo(payload);
 
@@ -205,11 +247,12 @@ namespace StreamDB
                 if (entryLength < StreamHeader.Size)
                     continue;
 
-                int entryIdx = StreamHeader.ReadSecondaryIndex(entry.AsSpan());
+                ReadOnlySpan<byte> header = entry.AsSpan();
+                int entryIdx = StreamHeader.ReadSecondaryIndex(header);
                 if (!indexes.Contains(entryIdx))
                     continue;
 
-                long pi = StreamHeader.ReadPrimaryIndex(entry.AsSpan());
+                long pi = StreamHeader.ReadPrimaryIndex(header);
                 if (pi >= fromPrimaryIndex)
                     return pi;
             }

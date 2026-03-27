@@ -394,7 +394,11 @@ namespace StreamDB
             // Detect out-of-order (late arrival) writes.
             // AddOrUpdate returns the NEW value: max(prev, primaryIndex).
             // If primaryIndex < returned value, a higher primary index was already seen → late arrival.
-            long maxPi = _maxPrimaryIndexes.AddOrUpdate(secondaryIndex, primaryIndex, (_, prev) => Math.Max(prev, primaryIndex));
+            long maxPi = _maxPrimaryIndexes.AddOrUpdate(
+                secondaryIndex,
+                static (_, arg) => arg,
+                static (_, prev, arg) => Math.Max(prev, arg),
+                primaryIndex);
             if (primaryIndex < maxPi)
             {
                 Interlocked.Increment(ref _lateArrivalCount);
