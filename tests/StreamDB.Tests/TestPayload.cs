@@ -12,6 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-using BenchmarkDotNet.Running;
+using System.Runtime.InteropServices;
 
-BenchmarkSwitcher.FromAssembly(typeof(WriteBenchmarks).Assembly).Run(args);
+namespace StreamDB.Tests;
+
+[StructLayout(LayoutKind.Sequential)]
+public struct TestPayload
+{
+    public float Value;
+    public int Counter;
+}

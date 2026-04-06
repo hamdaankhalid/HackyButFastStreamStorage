@@ -12,6 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-using BenchmarkDotNet.Running;
+using System.Runtime.InteropServices;
 
-BenchmarkSwitcher.FromAssembly(typeof(WriteBenchmarks).Assembly).Run(args);
+[StructLayout(LayoutKind.Sequential)]
+public struct BenchPayload
+{
+    public double Latitude;
+    public double Longitude;
+    public float Speed;
+    public float Heading;
+}

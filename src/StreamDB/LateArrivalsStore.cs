@@ -127,18 +127,15 @@ namespace StreamDB
                 if (!result.ContainsKey(idx))
                     result[idx] = new List<StreamEntry>();
 
+                if (limit > 0 && result[idx].Count >= limit)
+                    continue;
+
                 result[idx].Add(new StreamEntry(
                     reader.GetInt64(0),
                     idx,
                     (ushort)reader.GetInt32(2),
                     (byte[])reader.GetValue(3)
                 ));
-
-                if (limit > 0 && result[idx].Count >= limit)
-                {
-                    // Per-index limit reached; skip further entries for this index.
-                    // Not perfectly efficient in SQL but late_arrivals is small.
-                }
             }
 
             return result;

@@ -94,7 +94,7 @@ namespace StreamDB
         private readonly Task _bgFlushRunner;
         private readonly ManualResetEventSlim _flushSignal = new(false);
         private readonly Lock _maintenanceLock = new(); // Ensures only one maintenance operation at a time
-        private readonly ReaderWriterLockSlim _indexWriteLock = new(LockRecursionPolicy.NoRecursion);
+        private readonly DeferrableRwLock _indexWriteLock = new();
 
         // Interlocked counter for pending index inserts. This is cheaper than calling _pendingIndexInserts.Count which is O(n) on ConcurrentQueue.
         private int _pendingIndexCount = 0;
@@ -244,7 +244,7 @@ namespace StreamDB
             // long lived allocations in the worker to avoid repeated allocations in the hot path
             List<(int SecondaryIndex, long PrimaryIndex, long Address)> batch = new List<(int SecondaryIndex, long PrimaryIndex, long Address)>(capacity: AdaptiveTuning[^1].batchSize);
             HashSet<int> referencedShards = new HashSet<int>(capacity: ShardCount);
-            var maxAddrPerShard = new long[ShardCount];
+            long[] maxAddrPerShard = new long[ShardCount];
 
             while (!_disposed)
             {
@@ -263,7 +263,7 @@ namespace StreamDB
 
                     // Acquire read lock - allows concurrent flushes but blocks during checkpoint (write lock)
                     // Use blocking lock to ensure queue continues draining even during checkpoints
-                    _indexWriteLock.EnterReadLock();
+                    bool actualLockAcquired = _indexWriteLock.EnterReadLock();
                     try
                     {
                         // Collect a batch of entries and ensure FasterLog durability before SQLite indexing
@@ -283,7 +283,7 @@ namespace StreamDB
                                 Interlocked.Decrement(ref _pendingIndexCount);
 
                                 batch.Add(entry);
-                                var shardIndex = entry.SecondaryIndex & ShardMask;
+                                int shardIndex = entry.SecondaryIndex & ShardMask;
                                 referencedShards.Add(shardIndex);
                                 if (entry.Address > maxAddrPerShard[shardIndex])
                                 {
@@ -343,7 +343,7 @@ namespace StreamDB
                     finally
                     {
                         // Always release read lock, even on error
-                        _indexWriteLock.ExitReadLock();
+                        _indexWriteLock.ExitReadLock(actualLockAcquired);
                     }
                 }
             }
@@ -431,14 +431,14 @@ namespace StreamDB
 
                     Interlocked.Increment(ref _lateArrivalCount);
                     // Acquire read lock so late arrival writes are blocked during checkpoint (write lock)
-                    _indexWriteLock.EnterReadLock();
+                    bool actualLockAcquired = _indexWriteLock.EnterReadLock();
                     try
                     {
                         _lateArrivals.Insert(secondaryIndex, primaryIndex, version, payload);
                     }
                     finally
                     {
-                        _indexWriteLock.ExitReadLock();
+                        _indexWriteLock.ExitReadLock(actualLockAcquired);
                     }
                     return;
                 }
@@ -477,7 +477,7 @@ namespace StreamDB
         }
 
         /// <summary>
-        /// For testing: ensures all pending index entries have been written to SQLite.
+        /// Ensures all pending index entries have been written to SQLite.
         /// Signals the worker and waits for the queue to be drained.
         /// </summary>
         public void WaitForPendingWrites()
@@ -488,29 +488,26 @@ namespace StreamDB
             _flushSignal.Set();
 
             // Wait for worker to process all entries
-            Stopwatch sw = Stopwatch.StartNew();
-            while (!_pendingIndexInserts.IsEmpty && sw.Elapsed < TimeSpan.FromSeconds(10))
+            while (!_pendingIndexInserts.IsEmpty)
             {
-                Thread.Sleep(50);
+                Thread.Yield();
             }
-
-            // Give worker a bit more time to complete any in-flight batch
-            Thread.Sleep(100);
         }
 
         /// <summary>
         /// Get statistics about adaptive tuning and index queue behavior.
         /// </summary>
-        public StreamDbStats GetStats() => new StreamDbStats(
-                Volatile.Read(ref _scaleUpCount),
-                Volatile.Read(ref _scaleDownCount),
-                Volatile.Read(ref _droppedIndexEntries),
-                Volatile.Read(ref _adaptiveIdx),
-                Volatile.Read(ref _pendingIndexCount),
-                Volatile.Read(ref _lateArrivalCount),
-                Volatile.Read(ref _jitterAbsorbedCount),
-                Volatile.Read(ref _droppedLateArrivals)
-            );
+        public StreamDbStats GetStats() => new StreamDbStats
+        {
+            ScaleUp = Volatile.Read(ref _scaleUpCount),
+            ScaleDown = Volatile.Read(ref _scaleDownCount),
+            Dropped = Volatile.Read(ref _droppedIndexEntries),
+            AdaptiveIdx = Volatile.Read(ref _adaptiveIdx),
+            PendingIdxQueueLen = Volatile.Read(ref _pendingIndexCount),
+            LateArrivals = Volatile.Read(ref _lateArrivalCount),
+            JitterAbsorbed = Volatile.Read(ref _jitterAbsorbedCount),
+            DroppedLateArrivals = Volatile.Read(ref _droppedLateArrivals)
+        };
 
         #endregion
 
@@ -623,14 +620,13 @@ namespace StreamDB
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
 
-            List<int> indexList = secondaryIndexes.ToList();
             _logger?.LogDebug("ReadRange (multi-index): secondaryIndexes=[{Indexes}], start={StartPrimaryIndex}, end={EndPrimaryIndex}, limit={Limit}",
-                string.Join(", ", indexList), startPrimaryIndex, endPrimaryIndex, limit);
+                string.Join(", ", secondaryIndexes), startPrimaryIndex, endPrimaryIndex, limit);
 
             // Group secondary indexes by shard so we can scan each shard at most once.
             Dictionary<int, (HashSet<int> Indexes, long MinAddress)> shardGroups = new Dictionary<int, (HashSet<int> Indexes, long MinAddress)>();
 
-            foreach (int idx in indexList)
+            foreach (int idx in secondaryIndexes)
             {
                 int shardIndex = idx & ShardMask;
                 long addr = LookupNearestAddress(idx, startPrimaryIndex);
@@ -639,7 +635,9 @@ namespace StreamDB
                 {
                     group.Indexes.Add(idx);
                     if (addr < group.MinAddress)
+                    {
                         shardGroups[shardIndex] = (group.Indexes, addr);
+                    }
                 }
                 else
                 {
@@ -666,9 +664,11 @@ namespace StreamDB
 
             // Only merge with late arrivals if there are any
             if (Volatile.Read(ref _lateArrivalCount) > 0)
-                MergeLateArrivals(result, _lateArrivals.QueryRange(indexList, startPrimaryIndex, endPrimaryIndex, limit), limit);
+            {
+                MergeLateArrivals(result, _lateArrivals.QueryRange(secondaryIndexes, startPrimaryIndex, endPrimaryIndex, limit), limit);
+            }
 
-            var totalItems = result.Values.Sum(list => list.Count);
+            int totalItems = result.Values.Sum(list => list.Count);
             _logger?.LogDebug("ReadRange (multi-index): returned {TotalItems} items across {Count} indexes",
                 totalItems, result.Count);
 
@@ -708,7 +708,7 @@ namespace StreamDB
             if (Volatile.Read(ref _lateArrivalCount) > 0)
                 MergeLateArrivals(result, _lateArrivals.QueryRangeAll(startPrimaryIndex, endPrimaryIndex, limit), limit);
 
-            var totalItems = result.Values.Sum(list => list.Count);
+            int totalItems = result.Values.Sum(list => list.Count);
             _logger?.LogDebug("ReadRange (all-indexes): returned {TotalItems} items across {Count} indexes",
                 totalItems, result.Count);
 
@@ -724,13 +724,12 @@ namespace StreamDB
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
 
-            List<int> indexList = secondaryIndexes.ToList();
             _logger?.LogDebug("GetEarliestPrimaryIndex: secondaryIndexes=[{Indexes}], from={FromPrimaryIndex}",
-                string.Join(", ", indexList), fromPrimaryIndex);
+                string.Join(", ", secondaryIndexes), fromPrimaryIndex);
 
             Dictionary<int, (HashSet<int> Indexes, long MinAddress)> shardGroups = new Dictionary<int, (HashSet<int> Indexes, long MinAddress)>();
 
-            foreach (int idx in indexList)
+            foreach (int idx in secondaryIndexes)
             {
                 int shardIndex = idx & ShardMask;
                 long addr = LookupNearestAddress(idx, fromPrimaryIndex);
@@ -768,7 +767,7 @@ namespace StreamDB
             // Also check late arrivals if any exist
             if (Volatile.Read(ref _lateArrivalCount) > 0)
             {
-                long? lateMin = _lateArrivals.GetEarliestPrimaryIndex(indexList, fromPrimaryIndex);
+                long? lateMin = _lateArrivals.GetEarliestPrimaryIndex(secondaryIndexes, fromPrimaryIndex);
                 if (lateMin.HasValue && (!globalMin.HasValue || lateMin.Value < globalMin.Value))
                     globalMin = lateMin.Value;
             }
@@ -791,13 +790,11 @@ namespace StreamDB
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
 
-            List<int> indexList = secondaryIndexes.ToList();
-
             _logger?.LogDebug("ReadRangeFromAvailable: secondaryIndexes=[{Indexes}], from={FromPrimaryIndex}, window={Window}, limit={Limit}",
-                string.Join(", ", indexList), fromPrimaryIndex, window, limit);
+                string.Join(", ", secondaryIndexes), fromPrimaryIndex, window, limit);
 
             // Find the earliest available primary index across both sources
-            long? earliest = GetEarliestPrimaryIndex(indexList, fromPrimaryIndex);
+            long? earliest = GetEarliestPrimaryIndex(secondaryIndexes, fromPrimaryIndex);
             if (!earliest.HasValue)
             {
                 _logger?.LogDebug("ReadRangeFromAvailable: no data found");
@@ -807,9 +804,9 @@ namespace StreamDB
             long rangeEnd = earliest.Value + window;
 
             // ReadRange already merges FasterLog + late arrivals
-            Dictionary<int, List<StreamEntry>> data = ReadRange(indexList, earliest.Value, rangeEnd, limit);
+            Dictionary<int, List<StreamEntry>> data = ReadRange(secondaryIndexes, earliest.Value, rangeEnd, limit);
 
-            var totalItems = data.Values.Sum(list => list.Count);
+            int totalItems = data.Values.Sum(list => list.Count);
             _logger?.LogDebug("ReadRangeFromAvailable: returned {TotalItems} items across {Count} indexes, rangeEnd={RangeEnd}",
                 totalItems, data.Count, rangeEnd);
 
@@ -923,7 +920,7 @@ namespace StreamDB
 
             try
             {
-                _logger?.LogInformation("RunCheckpoint: starting checkpoint window");
+                _logger?.LogInformation("RunCheckpoint: starting checkpoint window with WAL size bytes");
 
                 // Acquire write lock - blocks until all ongoing index writes (read locks) complete
                 // and prevents new index writes from starting
@@ -959,8 +956,9 @@ namespace StreamDB
                         }
                         else
                         {
-                            _logger?.LogInformation("RunCheckpoint: checkpoint complete in {Elapsed}s - {Checkpointed} frames checkpointed from {Log} total frames",
-                                sw.Elapsed.TotalSeconds, checkpointed, log);
+                            _logger?.LogInformation(
+                                "RunCheckpoint: checkpoint complete in {Elapsed}s - {Checkpointed} frames ( {CheckpointedBytes} bytes) checkpointed from {Log} total frames",
+                                sw.Elapsed.TotalSeconds, checkpointed, checkpointed * 4096, log);
                         }
                     }
                     else
@@ -1218,8 +1216,5 @@ namespace StreamDB
             // at shutdown is acceptable - reads will still work by scanning from the
             // previous indexed entry.
         }
-
     }
-
-    public record class StreamDbStats(long ScaleUp, long ScaleDown, long Dropped, int AdaptiveIdx, long PendingIdxQueueLen, long LateArrivals, long JitterAbsorbed, long DroppedLateArrivals);
 }

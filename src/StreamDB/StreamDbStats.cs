@@ -12,6 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-using BenchmarkDotNet.Running;
-
-BenchmarkSwitcher.FromAssembly(typeof(WriteBenchmarks).Assembly).Run(args);
+namespace StreamDB
+{
+  public record class StreamDbStats
+  {
+    public required long ScaleUp { get; init; }
+    public required long ScaleDown { get; init; }
+    public required long Dropped { get; init; }
+    public required int AdaptiveIdx { get; init; }
+    public required long PendingIdxQueueLen { get; init; }
+    public required long LateArrivals { get; init; }
+    public required long JitterAbsorbed { get; init; }
+    public required long DroppedLateArrivals { get; init; }
+  }
+}
