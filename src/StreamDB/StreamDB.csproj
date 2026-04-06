@@ -8,7 +8,7 @@
 
     <!-- NuGet package metadata -->
     <PackageId>StreamDB</PackageId>
-    <Version>1.0.0</Version>
+    <Version>1.0.1</Version>
     <Authors>Hamdaan Khalid</Authors>
     <Description>High-throughput schema-on-read stream storage engine for time-series data, built on FASTER and SQLite.</Description>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
