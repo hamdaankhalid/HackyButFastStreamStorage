@@ -319,7 +319,7 @@ namespace StreamDB
                             using SqliteTransaction tx = pooled.Connection.BeginTransaction();
                             using SqliteCommand cmd = pooled.Connection.CreateCommand();
                             cmd.Transaction = tx;
-                            cmd.CommandText = "INSERT INTO stream_index (secondary_index, primary_index, log_address) VALUES ($sidx, $pi, $addr)";
+                            cmd.CommandText = "INSERT OR IGNORE INTO stream_index (secondary_index, primary_index, log_address) VALUES ($sidx, $pi, $addr)";
                             SqliteParameter pDid = cmd.Parameters.Add("$sidx", SqliteType.Integer);
                             SqliteParameter pPi = cmd.Parameters.Add("$pi", SqliteType.Integer);
                             SqliteParameter pAddr = cmd.Parameters.Add("$addr", SqliteType.Integer);
@@ -452,9 +452,10 @@ namespace StreamDB
             LogShard shard = GetShard(secondaryIndex);
             int count = _writeCounts.AddOrUpdate(secondaryIndex, 1, static (_, prev) => prev + 1);
 
-            // Use adaptive indexing frequency
+            // Use adaptive indexing frequency — but always index the very first write
+            // per secondary index to guarantee a sparse-index floor entry exists.
             (int indexSpacing, int batchSize, int indexSpacingMask) = AdaptiveTuning[Volatile.Read(ref _adaptiveIdx)];
-            bool shouldIndex = (count & indexSpacingMask) == 0;
+            bool shouldIndex = count == 1 || (count & indexSpacingMask) == 0;
 
             long address = shard.Enqueue(secondaryIndex, payload, primaryIndex, version);
 
@@ -634,15 +635,18 @@ namespace StreamDB
 
                 if (addr == 0)
                 {
-                    // No backward hit: use forward lookup to check if device has any indexed data.
+                    // No backward hit: use forward lookup to check if this index has any data at all.
                     var forward = LookupFirstAddressAtOrAfter(idx, startPrimaryIndex);
                     if (!forward.HasValue)
                     {
                         _logger?.LogDebug("ReadRange (multi-index): skipping secondaryIndex={SecondaryIndex} — no indexed data", idx);
                         continue;
                     }
-                    // Forward hit exists: device has data. Unindexed entries may exist before the
-                    // first index entry. Scan from shard beginning (addr stays 0).
+                    // Forward hit exists but no backward hit. Floor indexing should prevent
+                    // this, but as a defensive fallback use the forward hit's address.
+                    addr = forward.Value.Address;
+                    _logger?.LogWarning("ReadRange (multi-index): no backward hit for secondaryIndex={SecondaryIndex}, using forward address {Address}",
+                        idx, addr);
                 }
 
                 int shardIndex = idx & ShardMask;
@@ -770,16 +774,20 @@ namespace StreamDB
                     var forward = LookupFirstAddressAtOrAfter(idx, fromPrimaryIndex);
                     if (forward.HasValue)
                     {
-                        // Forward hit: device has data but first index entry is after fromPrimaryIndex.
-                        // Unindexed entries may exist before it — scan from shard beginning.
+                        // Forward hit exists but no backward hit. Floor indexing should prevent
+                        // this, but as a defensive fallback use the forward hit's address.
+                        long forwardAddr = forward.Value.Address;
+                        _logger?.LogWarning("GetEarliestPrimaryIndex: no backward hit for secondaryIndex={SecondaryIndex}, using forward address {Address}",
+                            idx, forwardAddr);
+
                         if (shardGroups.TryGetValue(shardIndex, out (HashSet<int> Indexes, long MinAddress) group))
                         {
                             group.Indexes.Add(idx);
-                            shardGroups[shardIndex] = (group.Indexes, Math.Min(group.MinAddress, 0));
+                            shardGroups[shardIndex] = (group.Indexes, Math.Min(group.MinAddress, forwardAddr));
                         }
                         else
                         {
-                            shardGroups[shardIndex] = (new HashSet<int> { idx }, 0);
+                            shardGroups[shardIndex] = (new HashSet<int> { idx }, forwardAddr);
                         }
 
                         if (!globalMin.HasValue || forward.Value.PrimaryIndex < globalMin.Value)
@@ -1088,6 +1096,7 @@ namespace StreamDB
                 if (remainingLateArrivals == 0)
                     Volatile.Write(ref _lateArrivalCount, 0);
                 TruncateShards(cutoffPi);
+                ReindexFloorEntries(cutoffPi);
 
                 _logger?.LogInformation("RunRetention: retention complete");
             }
@@ -1143,6 +1152,56 @@ namespace StreamDB
                     _shards[shardIndex].TruncateUntil(minAddr);
                 }
             }
+        }
+
+        /// <summary>
+        /// After retention purge + truncation, re-insert floor entries for any secondary index
+        /// whose earliest surviving index row has a log_address beyond its shard's BeginAddress.
+        /// This guarantees a backward hit always exists, preventing full-shard scans.
+        /// </summary>
+        private void ReindexFloorEntries(long cutoffPi)
+        {
+            using PooledConnection pooled = GetConnection();
+
+            // Find secondary indexes whose earliest entry may not cover the shard start.
+            using SqliteCommand queryCmd = pooled.Connection.CreateCommand();
+            queryCmd.CommandText = "SELECT secondary_index, MIN(log_address) FROM stream_index GROUP BY secondary_index";
+            var candidates = new List<(int SecondaryIndex, long MinAddr)>();
+            using (SqliteDataReader reader = queryCmd.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    candidates.Add((reader.GetInt32(0), reader.GetInt64(1)));
+                }
+            }
+
+            if (candidates.Count == 0)
+                return;
+
+            // Insert floor entries where the earliest index row is past the shard's begin address.
+            using SqliteCommand insertCmd = pooled.Connection.CreateCommand();
+            insertCmd.CommandText = "INSERT OR IGNORE INTO stream_index (secondary_index, primary_index, log_address) VALUES ($sidx, $pi, $addr)";
+            SqliteParameter pSidx = insertCmd.Parameters.Add("$sidx", SqliteType.Integer);
+            SqliteParameter pPi = insertCmd.Parameters.Add("$pi", SqliteType.Integer);
+            SqliteParameter pAddr = insertCmd.Parameters.Add("$addr", SqliteType.Integer);
+            insertCmd.Prepare();
+
+            int inserted = 0;
+            foreach ((int secondaryIndex, long minAddr) in candidates)
+            {
+                long shardBegin = _shards[secondaryIndex & ShardMask].BeginAddress;
+                if (minAddr > shardBegin)
+                {
+                    pSidx.Value = secondaryIndex;
+                    pPi.Value = cutoffPi;
+                    pAddr.Value = shardBegin;
+                    insertCmd.ExecuteNonQuery();
+                    inserted++;
+                }
+            }
+
+            if (inserted > 0)
+                _logger?.LogInformation("ReindexFloorEntries: inserted {Count} floor entries", inserted);
         }
 
         #endregion
