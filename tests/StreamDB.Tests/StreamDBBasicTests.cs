@@ -27,7 +27,7 @@ public class StreamDBBasicTests
     public void SetUp()
     {
         _dataDir = Path.Combine(Path.GetTempPath(), $"streamdb-test-{Guid.NewGuid():N}");
-        _db = new StreamDB(baseDir: _dataDir);
+        _db = new StreamDB(baseDir: _dataDir, initialAdaptiveIdx: 0);
     }
 
     [TearDown]

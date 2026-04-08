@@ -27,7 +27,7 @@ public class StreamDBJitterWindowTests
     public void SetUp()
     {
         _dataDir = Path.Combine(Path.GetTempPath(), $"streamdb-test-{Guid.NewGuid():N}");
-        _db = new StreamDB(baseDir: _dataDir, jitterWindow: 50);
+        _db = new StreamDB(baseDir: _dataDir, jitterWindow: 50, initialAdaptiveIdx: 0);
     }
 
     [TearDown]

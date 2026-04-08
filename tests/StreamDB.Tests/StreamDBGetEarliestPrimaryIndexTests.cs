@@ -27,7 +27,7 @@ public class StreamDBGetEarliestPrimaryIndexTests
     public void SetUp()
     {
         _dataDir = Path.Combine(Path.GetTempPath(), $"streamdb-test-{Guid.NewGuid():N}");
-        _db = new StreamDB(baseDir: _dataDir);
+        _db = new StreamDB(baseDir: _dataDir, initialAdaptiveIdx: 0);
     }
 
     [TearDown]
@@ -48,9 +48,12 @@ public class StreamDBGetEarliestPrimaryIndexTests
     [Test]
     public void GetEarliestPrimaryIndex_ReturnsEarliest()
     {
-        AppendPayload(1, 200);
-        AppendPayload(2, 100);
-        AppendPayload(3, 300);
+        for (int i = 0; i < 20; i++)
+        {
+            AppendPayload(1, 200 + i);
+            AppendPayload(2, 100 + i);
+            AppendPayload(3, 300 + i);
+        }
         _db.WaitForPendingWrites();
 
         long? earliest = _db.GetEarliestPrimaryIndex(new[] { 1, 2, 3 }, fromPrimaryIndex: 0);
@@ -60,13 +63,12 @@ public class StreamDBGetEarliestPrimaryIndexTests
     [Test]
     public void GetEarliestPrimaryIndex_RespectsFromPrimaryIndex()
     {
-        AppendPayload(1, 100);
-        AppendPayload(1, 200);
-        AppendPayload(1, 300);
+        for (int i = 0; i < 20; i++)
+            AppendPayload(1, 100 + i * 10);
         _db.WaitForPendingWrites();
 
         long? earliest = _db.GetEarliestPrimaryIndex(new[] { 1 }, fromPrimaryIndex: 150);
-        Assert.That(earliest, Is.EqualTo(200));
+        Assert.That(earliest, Is.EqualTo(150));
     }
 
     [Test]

@@ -27,7 +27,7 @@ public class StreamDBMultiIndexTests
     public void SetUp()
     {
         _dataDir = Path.Combine(Path.GetTempPath(), $"streamdb-test-{Guid.NewGuid():N}");
-        _db = new StreamDB(baseDir: _dataDir);
+        _db = new StreamDB(baseDir: _dataDir, initialAdaptiveIdx: 0);
     }
 
     [TearDown]
@@ -48,7 +48,7 @@ public class StreamDBMultiIndexTests
     [Test]
     public void ReadRange_MultiIndex_ReturnsPerIndex()
     {
-        for (int i = 0; i < 5; i++)
+        for (int i = 0; i < 20; i++)
         {
             AppendPayload(1, 100 + i);
             AppendPayload(2, 100 + i);
@@ -56,32 +56,36 @@ public class StreamDBMultiIndexTests
         }
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(secondaryIndexes: new[] { 1, 2, 3 }, startPrimaryIndex: 100, endPrimaryIndex: 104);
+        var results = _db.ReadRange(secondaryIndexes: new[] { 1, 2, 3 }, startPrimaryIndex: 100, endPrimaryIndex: 119);
         Assert.That(results.Keys, Has.Count.EqualTo(3));
-        Assert.That(results[1], Has.Count.EqualTo(5));
-        Assert.That(results[2], Has.Count.EqualTo(5));
-        Assert.That(results[3], Has.Count.EqualTo(5));
+        Assert.That(results[1], Has.Count.EqualTo(20));
+        Assert.That(results[2], Has.Count.EqualTo(20));
+        Assert.That(results[3], Has.Count.EqualTo(20));
     }
 
     [Test]
     public void ReadRange_MultiIndex_MixedResults()
     {
-        AppendPayload(1, 100);
-        AppendPayload(1, 200);
-        AppendPayload(2, 150);
+        for (int i = 0; i < 20; i++)
+            AppendPayload(1, 100 + i * 10);
+        for (int i = 0; i < 20; i++)
+            AppendPayload(2, 150 + i * 10);
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(secondaryIndexes: new[] { 1, 2 }, startPrimaryIndex: 100, endPrimaryIndex: 200);
-        Assert.That(results[1], Has.Count.EqualTo(2));
-        Assert.That(results[2], Has.Count.EqualTo(1));
+        var results = _db.ReadRange(secondaryIndexes: new[] { 1, 2 }, startPrimaryIndex: 100, endPrimaryIndex: 300);
+        Assert.That(results[1], Has.Count.EqualTo(20));
+        Assert.That(results[2], Has.Count.EqualTo(16)); // pi 150..300
     }
 
     [Test]
     public void ReadRange_AllIndexes()
     {
-        AppendPayload(1, 100);
-        AppendPayload(2, 100);
-        AppendPayload(3, 100);
+        for (int i = 0; i < 20; i++)
+        {
+            AppendPayload(1, 100 + i);
+            AppendPayload(2, 100 + i);
+            AppendPayload(3, 100 + i);
+        }
         _db.WaitForPendingWrites();
 
         var results = _db.ReadRange(startPrimaryIndex: 0, endPrimaryIndex: 200);

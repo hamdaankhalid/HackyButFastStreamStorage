@@ -93,6 +93,7 @@ namespace StreamDB
         private readonly ILogger<StreamDB>? _logger;
         private readonly Task _bgFlushRunner;
         private readonly ManualResetEventSlim _flushSignal = new(false);
+        private readonly ManualResetEventSlim _flushIdle = new(true);
         private readonly Lock _maintenanceLock = new(); // Ensures only one maintenance operation at a time
         private readonly DeferrableRwLock _indexWriteLock = new();
 
@@ -127,11 +128,12 @@ namespace StreamDB
 
         #endregion
 
-        public StreamDB(string? baseDir = null, TimeSpan? retentionPeriod = null, TimeSpan? checkpointInterval = null, long jitterWindow = 0, ILogger<StreamDB>? logger = null)
+        public StreamDB(string? baseDir = null, TimeSpan? retentionPeriod = null, TimeSpan? checkpointInterval = null, long jitterWindow = 0, ILogger<StreamDB>? logger = null, int initialAdaptiveIdx = 6)
         {
             _logger = logger;
             _baseDir = baseDir ?? "streams";
             _jitterWindow = jitterWindow;
+            _adaptiveIdx = Math.Clamp(initialAdaptiveIdx, 0, AdaptiveTuning.Length - 1);
             Directory.CreateDirectory(_baseDir);
 
             _retentionPeriod = retentionPeriod ?? TimeSpan.FromDays(60);
@@ -258,6 +260,7 @@ namespace StreamDB
                 // Process all pending batches until queue is empty
                 while (!_pendingIndexInserts.IsEmpty && !_disposed)
                 {
+                    _flushIdle.Reset();
                     // Check tuning on every batch for responsiveness (before acquiring lock)
                     AdaptivelyTuneParameters();
 
@@ -346,6 +349,7 @@ namespace StreamDB
                         _indexWriteLock.ExitReadLock(actualLockAcquired);
                     }
                 }
+                _flushIdle.Set();
             }
         }
 
@@ -462,9 +466,9 @@ namespace StreamDB
                 int currentCount = Volatile.Read(ref _pendingIndexCount);
                 if (currentCount < QueueCapacity)
                 {
+                    _flushIdle.Reset();
                     Interlocked.Increment(ref _pendingIndexCount);
                     _pendingIndexInserts.Enqueue((secondaryIndex, primaryIndex, address));
-                    // in aggressive scenarios as index frequency goes down we want to make sure the worker is signaled to process the larger batches in a timely manner
                     _flushSignal.Set();
                 }
                 else
@@ -482,16 +486,13 @@ namespace StreamDB
         /// </summary>
         public void WaitForPendingWrites()
         {
-            if (_pendingIndexInserts.IsEmpty)
+            if (_pendingIndexInserts.IsEmpty && _flushIdle.IsSet)
                 return;
 
             _flushSignal.Set();
 
-            // Wait for worker to process all entries
-            while (!_pendingIndexInserts.IsEmpty)
-            {
-                Thread.Yield();
-            }
+            // Wait for worker to drain the queue AND finish committing to SQLite
+            _flushIdle.Wait();
         }
 
         /// <summary>
@@ -624,13 +625,27 @@ namespace StreamDB
                 string.Join(", ", secondaryIndexes), startPrimaryIndex, endPrimaryIndex, limit);
 
             // Group secondary indexes by shard so we can scan each shard at most once.
+            // Use forward lookup to skip devices whose data is entirely outside the query range.
             Dictionary<int, (HashSet<int> Indexes, long MinAddress)> shardGroups = new Dictionary<int, (HashSet<int> Indexes, long MinAddress)>();
 
             foreach (int idx in secondaryIndexes)
             {
-                int shardIndex = idx & ShardMask;
                 long addr = LookupNearestAddress(idx, startPrimaryIndex);
 
+                if (addr == 0)
+                {
+                    // No backward hit: use forward lookup to check if device has any indexed data.
+                    var forward = LookupFirstAddressAtOrAfter(idx, startPrimaryIndex);
+                    if (!forward.HasValue)
+                    {
+                        _logger?.LogDebug("ReadRange (multi-index): skipping secondaryIndex={SecondaryIndex} — no indexed data", idx);
+                        continue;
+                    }
+                    // Forward hit exists: device has data. Unindexed entries may exist before the
+                    // first index entry. Scan from shard beginning (addr stays 0).
+                }
+
+                int shardIndex = idx & ShardMask;
                 if (shardGroups.TryGetValue(shardIndex, out (HashSet<int> Indexes, long MinAddress) group))
                 {
                     group.Indexes.Add(idx);
@@ -727,6 +742,7 @@ namespace StreamDB
             _logger?.LogDebug("GetEarliestPrimaryIndex: secondaryIndexes=[{Indexes}], from={FromPrimaryIndex}",
                 string.Join(", ", secondaryIndexes), fromPrimaryIndex);
 
+            long? globalMin = null;
             Dictionary<int, (HashSet<int> Indexes, long MinAddress)> shardGroups = new Dictionary<int, (HashSet<int> Indexes, long MinAddress)>();
 
             foreach (int idx in secondaryIndexes)
@@ -734,19 +750,44 @@ namespace StreamDB
                 int shardIndex = idx & ShardMask;
                 long addr = LookupNearestAddress(idx, fromPrimaryIndex);
 
-                if (shardGroups.TryGetValue(shardIndex, out (HashSet<int> Indexes, long MinAddress) group))
+                if (addr > 0)
                 {
-                    group.Indexes.Add(idx);
-                    if (addr < group.MinAddress)
-                        shardGroups[shardIndex] = (group.Indexes, addr);
+                    // Backward hit: scan from this address.
+                    if (shardGroups.TryGetValue(shardIndex, out (HashSet<int> Indexes, long MinAddress) group))
+                    {
+                        group.Indexes.Add(idx);
+                        if (addr < group.MinAddress)
+                            shardGroups[shardIndex] = (group.Indexes, addr);
+                    }
+                    else
+                    {
+                        shardGroups[shardIndex] = (new HashSet<int> { idx }, addr);
+                    }
                 }
                 else
                 {
-                    shardGroups[shardIndex] = (new HashSet<int> { idx }, addr);
+                    // No backward hit: use forward lookup to check if device has any indexed data.
+                    var forward = LookupFirstAddressAtOrAfter(idx, fromPrimaryIndex);
+                    if (forward.HasValue)
+                    {
+                        // Forward hit: device has data but first index entry is after fromPrimaryIndex.
+                        // Unindexed entries may exist before it — scan from shard beginning.
+                        if (shardGroups.TryGetValue(shardIndex, out (HashSet<int> Indexes, long MinAddress) group))
+                        {
+                            group.Indexes.Add(idx);
+                            shardGroups[shardIndex] = (group.Indexes, Math.Min(group.MinAddress, 0));
+                        }
+                        else
+                        {
+                            shardGroups[shardIndex] = (new HashSet<int> { idx }, 0);
+                        }
+
+                        if (!globalMin.HasValue || forward.Value.PrimaryIndex < globalMin.Value)
+                            globalMin = forward.Value.PrimaryIndex;
+                    }
+                    // else: no indexed data at all — skip this device
                 }
             }
-
-            long? globalMin = null;
 
             _logger?.LogDebug("GetEarliestPrimaryIndex: grouped into {ShardCount} shards", shardGroups.Count);
 
@@ -835,6 +876,37 @@ namespace StreamDB
                 secondaryIndex, startPrimaryIndex, addr);
 
             return addr;
+        }
+
+        /// <summary>
+        /// Find the first indexed entry at or after <paramref name="primaryIndex"/> for this secondary index.
+        /// Returns the primary index and FasterLog address, or null if no such entry exists.
+        /// Uses the B-tree primary key index for O(log N) lookup.
+        /// </summary>
+        private (long PrimaryIndex, long Address)? LookupFirstAddressAtOrAfter(int secondaryIndex, long primaryIndex)
+        {
+            using PooledConnection pooled = GetConnection();
+            using SqliteCommand cmd = pooled.Connection.CreateCommand();
+            cmd.CommandText = "SELECT primary_index, log_address FROM stream_index WHERE secondary_index = $sidx AND primary_index >= $pi ORDER BY primary_index ASC LIMIT 1";
+            SqliteParameter pSidx = cmd.Parameters.Add("$sidx", SqliteType.Integer);
+            SqliteParameter pPi = cmd.Parameters.Add("$pi", SqliteType.Integer);
+            cmd.Prepare();
+
+            pSidx.Value = secondaryIndex;
+            pPi.Value = primaryIndex;
+            using SqliteDataReader reader = cmd.ExecuteReader();
+            if (reader.Read())
+            {
+                long pi = reader.GetInt64(0);
+                long addr = reader.GetInt64(1);
+                _logger?.LogDebug("LookupFirstAddressAtOrAfter: secondaryIndex={SecondaryIndex}, from={PrimaryIndex} -> pi={Pi}, address={Address}",
+                    secondaryIndex, primaryIndex, pi, addr);
+                return (pi, addr);
+            }
+
+            _logger?.LogDebug("LookupFirstAddressAtOrAfter: secondaryIndex={SecondaryIndex}, from={PrimaryIndex} -> null",
+                secondaryIndex, primaryIndex);
+            return null;
         }
 
         /// <summary>

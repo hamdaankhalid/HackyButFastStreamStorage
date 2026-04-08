@@ -19,13 +19,14 @@ cd "$SCRIPT_DIR"
 # Override version if provided
 VERSION_FLAG=""
 if [ -n "$VERSION" ]; then
-    VERSION_FLAG="/p:Version=$VERSION"
+    VERSION_FLAG="-p:Version=$VERSION"
     echo "Publishing StreamDB v$VERSION"
 else
     echo "Publishing StreamDB (version from csproj)"
 fi
 
 # Clean previous artifacts
+rm -rf ./artifacts/*.nupkg
 rm -rf src/StreamDB/bin/Release/*.nupkg
 
 # Build and pack

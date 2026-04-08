@@ -23,7 +23,7 @@ public class StreamDBDisposeTests
     public void Append_AfterDispose_Throws()
     {
         string dataDir = Path.Combine(Path.GetTempPath(), $"streamdb-test-{Guid.NewGuid():N}");
-        var db = new StreamDB(baseDir: dataDir);
+        var db = new StreamDB(baseDir: dataDir, initialAdaptiveIdx: 0);
         db.Dispose();
 
         try
@@ -42,7 +42,7 @@ public class StreamDBDisposeTests
     public void ReadRange_AfterDispose_Throws()
     {
         string dataDir = Path.Combine(Path.GetTempPath(), $"streamdb-test-{Guid.NewGuid():N}");
-        var db = new StreamDB(baseDir: dataDir);
+        var db = new StreamDB(baseDir: dataDir, initialAdaptiveIdx: 0);
         db.Dispose();
 
         try
@@ -60,7 +60,7 @@ public class StreamDBDisposeTests
     public void DoubleDispose_DoesNotThrow()
     {
         string dataDir = Path.Combine(Path.GetTempPath(), $"streamdb-test-{Guid.NewGuid():N}");
-        var db = new StreamDB(baseDir: dataDir);
+        var db = new StreamDB(baseDir: dataDir, initialAdaptiveIdx: 0);
         try
         {
             db.Dispose();

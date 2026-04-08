@@ -27,7 +27,7 @@ public class StreamDBLateArrivalsTests
     public void SetUp()
     {
         _dataDir = Path.Combine(Path.GetTempPath(), $"streamdb-test-{Guid.NewGuid():N}");
-        _db = new StreamDB(baseDir: _dataDir);
+        _db = new StreamDB(baseDir: _dataDir, initialAdaptiveIdx: 0);
     }
 
     [TearDown]
@@ -154,23 +154,24 @@ public class StreamDBLateArrivalsTests
     [Test]
     public void LateArrival_MultiIndex_ReadRange()
     {
-        AppendPayload(1, 100);
-        AppendPayload(1, 300);
-        AppendPayload(2, 100);
-        AppendPayload(2, 300);
+        for (int i = 0; i < 20; i++)
+        {
+            AppendPayload(1, 100 + i);
+            AppendPayload(2, 100 + i);
+        }
 
-        // Late arrivals for both indexes
-        AppendPayload(1, 200);
-        AppendPayload(2, 200);
+        // Late arrivals for both indexes (below max seen)
+        AppendPayload(1, 50);
+        AppendPayload(2, 50);
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(secondaryIndexes: new[] { 1, 2 }, startPrimaryIndex: 100, endPrimaryIndex: 300);
-        Assert.That(results[1], Has.Count.EqualTo(3));
-        Assert.That(results[2], Has.Count.EqualTo(3));
+        var results = _db.ReadRange(secondaryIndexes: new[] { 1, 2 }, startPrimaryIndex: 50, endPrimaryIndex: 119);
+        Assert.That(results[1], Has.Count.EqualTo(21));
+        Assert.That(results[2], Has.Count.EqualTo(21));
 
-        // Both should be in primary index order
-        Assert.That(results[1][1].PrimaryIndex, Is.EqualTo(200));
-        Assert.That(results[2][1].PrimaryIndex, Is.EqualTo(200));
+        // Late arrivals should be first (pi=50)
+        Assert.That(results[1][0].PrimaryIndex, Is.EqualTo(50));
+        Assert.That(results[2][0].PrimaryIndex, Is.EqualTo(50));
     }
 
     [Test]
