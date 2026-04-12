@@ -16,18 +16,22 @@ using System.Runtime.InteropServices;
 using BenchmarkDotNet.Attributes;
 using Microsoft.Data.Sqlite;
 using RocksDbSharp;
+using StreamDB;
+using StreamDB.LiteLsm;
 
 [MemoryDiagnoser]
-[SimpleJob(iterationCount: 3, warmupCount: 1)]
+[SimpleJob(iterationCount: 5, warmupCount: 2)]
 public class WriteBenchmarks
 {
     private string _streamDbDir = null!;
     private string _sqliteDir = null!;
     private string _rocksDir = null!;
+    private string _liteLsmDir = null!;
 
     private StreamDB.StreamDB _streamDb = null!;
     private SqliteConnection _sqliteConn = null!;
     private RocksDb _rocksDb = null!;
+    private LiteLsm<long, BenchPayload> _liteLsm = null!;
     private WriteOptions _syncWriteOptions = null!;
 
     private byte[] _payloadBytes = null!;
@@ -78,6 +82,15 @@ public class WriteBenchmarks
         var options = new DbOptions().SetCreateIfMissing(true);
         _rocksDb = RocksDb.Open(options, _rocksDir);
         _syncWriteOptions = new WriteOptions().SetSync(true);
+
+        // LiteLsm
+        _liteLsmDir = Path.Combine(baseTmp, $"litelms-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(_liteLsmDir);
+        const int lsmCapacity = 32_768;
+        _liteLsm = new LiteLsm<long, BenchPayload>(
+            () => new StructSkipList<long, BenchPayload>(lsmCapacity),
+            Path.Combine(_liteLsmDir, "segments"),
+            memTableCapacity: lsmCapacity);
     }
 
     [IterationCleanup]
@@ -91,6 +104,7 @@ public class WriteBenchmarks
         TryDelete(_streamDbDir);
         TryDelete(_sqliteDir);
         TryDelete(_rocksDir);
+        TryDelete(_liteLsmDir);
     }
 
     [Benchmark(Baseline = true)]
@@ -158,6 +172,16 @@ public class WriteBenchmarks
                 batch.Put(keyBuffer.ToArray(), _payloadBytes);
             }
             _rocksDb.Write(batch, _syncWriteOptions); // fsync per batch
+        }
+    }
+
+    [Benchmark]
+    public void LiteLsm_SequentialWrites()
+    {
+        var payload = new BenchPayload { Latitude = 37.77, Longitude = -122.42, Speed = 60.0f, Heading = 90.0f };
+        for (int i = 0; i < RecordCount; i++)
+        {
+            _liteLsm.Put(1_000_000 + i, payload);
         }
     }
 

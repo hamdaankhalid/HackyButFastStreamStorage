@@ -16,20 +16,25 @@ using System.Runtime.InteropServices;
 using BenchmarkDotNet.Attributes;
 using Microsoft.Data.Sqlite;
 using RocksDbSharp;
+using StreamDB;
+using StreamDB.LiteLsm;
 
 [MemoryDiagnoser]
-[SimpleJob(iterationCount: 3, warmupCount: 1)]
+[SimpleJob(iterationCount: 5, warmupCount: 2)]
 public class ReadBenchmarks
 {
     private string _streamDbDir = null!;
     private string _sqliteDir = null!;
     private string _rocksDir = null!;
+    private string _liteLsmDir = null!;
 
     private StreamDB.StreamDB _streamDb = null!;
     private SqliteConnection _sqliteConn = null!;
     private RocksDb _rocksDb = null!;
+    private LiteLsm<long, BenchPayload> _liteLsm = null!;
+    private LiteLsm<long, BenchPayload> _liteLsmInMemory = null!;
 
-    private const int TotalRecords = 100_000;
+    private const int TotalRecords = 500_000;
     private const int SecondaryIndexCount = 4;
     private const long BasePi = 1_000_000;
 
@@ -109,6 +114,29 @@ public class ReadBenchmarks
             }
             _rocksDb.Write(batch);
         }
+
+        // LiteLsm setup
+        _liteLsmDir = Path.Combine(baseTmp, "litelms");
+        Directory.CreateDirectory(_liteLsmDir);
+        const int lsmCapacity = 32_768;
+        _liteLsm = new LiteLsm<long, BenchPayload>(
+            () => new StructSkipList<long, BenchPayload>(lsmCapacity),
+            Path.Combine(_liteLsmDir, "segments"),
+            memTableCapacity: lsmCapacity);
+        var lsmPayload = new BenchPayload { Latitude = 37.77, Longitude = -122.42, Speed = 60.0f, Heading = 90.0f };
+        for (int i = 0; i < TotalRecords; i++)
+            _liteLsm.Put(BasePi + i, lsmPayload);
+
+        // LiteLsm in-memory only: capacity larger than TotalRecords so nothing flushes to disk
+        var liteLsmInMemDir = Path.Combine(baseTmp, "litelms-inmem");
+        Directory.CreateDirectory(liteLsmInMemDir);
+        const int inMemCapacity = TotalRecords + 1;
+        _liteLsmInMemory = new LiteLsm<long, BenchPayload>(
+            () => new StructSkipList<long, BenchPayload>(inMemCapacity),
+            Path.Combine(liteLsmInMemDir, "segments"),
+            memTableCapacity: inMemCapacity);
+        for (int i = 0; i < TotalRecords; i++)
+            _liteLsmInMemory.Put(BasePi + i, lsmPayload);
     }
 
     [GlobalCleanup]
@@ -254,5 +282,44 @@ public class ReadBenchmarks
             }
         }
         return count;
+    }
+
+    [Benchmark]
+    public int LiteLsm_RangeRead()
+    {
+        // LiteLsm has no secondary indexes — query ~1000 entries to match other single-index reads
+        long startPi = BasePi + 10_000;
+        long endPi = startPi + 1000;
+        var results = _liteLsm.QueryRange(startPi, endPi).ToList();
+        return results.Count;
+    }
+
+    [Benchmark]
+    public int LiteLsm_MultiKeyRead()
+    {
+        // Comparable to multi-index reads: query ~4000 entries
+        long startPi = BasePi + 10_000;
+        long endPi = startPi + 4000;
+        var results = _liteLsm.QueryRange(startPi, endPi).ToList();
+        return results.Count;
+    }
+
+    [Benchmark]
+    public int LiteLsm_InMemory_RangeRead()
+    {
+        // All data in memtable — no disk I/O
+        long startPi = BasePi + 10_000;
+        long endPi = startPi + 1000;
+        var results = _liteLsmInMemory.QueryRange(startPi, endPi).ToList();
+        return results.Count;
+    }
+
+    [Benchmark]
+    public int LiteLsm_InMemory_MultiKeyRead()
+    {
+        long startPi = BasePi + 10_000;
+        long endPi = startPi + 4000;
+        var results = _liteLsmInMemory.QueryRange(startPi, endPi).ToList();
+        return results.Count;
     }
 }

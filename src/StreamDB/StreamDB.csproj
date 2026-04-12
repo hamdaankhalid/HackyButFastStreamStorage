@@ -26,6 +26,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="StreamDB.Tests" />
+    <InternalsVisibleTo Include="StreamDB.Benchmarks" />
   </ItemGroup>
 
   <ItemGroup>
