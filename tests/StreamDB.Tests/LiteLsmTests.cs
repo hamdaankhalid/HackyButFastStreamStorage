@@ -27,40 +27,31 @@ public class LiteLsmTests
     {
         _dataDir = Path.Combine(Path.GetTempPath(), $"litelsl-test-{Guid.NewGuid():N}");
         Directory.CreateDirectory(_dataDir);
-        
-        // Change to test directory so SegmentManager creates files there
-        Environment.CurrentDirectory = _dataDir;
     }
 
     [TearDown]
     public void TearDown()
     {
-        // Restore working directory before deleting temp dir to avoid
-        // NUnit crash when CWD no longer exists.
-        Environment.CurrentDirectory = Path.GetTempPath();
-        
         if (Directory.Exists(_dataDir))
-            Directory.Delete(_dataDir, recursive: true);
+        {
+            try { Directory.Delete(_dataDir, recursive: true); } catch { /* best effort — mmap files may still be held */ }
+        }
     }
 
-    private LiteLsm<TKey, TValue> CreateLsm<TKey, TValue>(SkipListType type = SkipListType.ClassBased)
+    private LiteLsm<TKey, TValue> CreateLsm<TKey, TValue>()
         where TKey : unmanaged, IComparable<TKey>
         where TValue : unmanaged
     {
-        return new LiteLsm<TKey, TValue>(() => type switch
-        {
-            SkipListType.ClassBased => new SkipList<TKey, TValue>(SegmentManager.SegmentSize),
-            SkipListType.StructBased => new StructSkipList<TKey, TValue>(SegmentManager.SegmentSize),
-            _ => throw new ArgumentException($"Unknown skip list type: {type}")
-        });
+        return new LiteLsm<TKey, TValue>(
+            () => new StructSkipList<TKey, TValue>(SegmentManager.SegmentSize),
+            Path.Combine(_dataDir, "segments"));
     }
 
-    [TestCase(SkipListType.ClassBased)]
-    [TestCase(SkipListType.StructBased)]
-    public void Put_And_TryGet_SingleValue_ReturnsCorrectValue(SkipListType skipListType)
+    [Test]
+    public void Put_And_TryGet_SingleValue_ReturnsCorrectValue()
     {
         // Arrange
-        var lsm = CreateLsm<long, long>(skipListType);
+        var lsm = CreateLsm<long, long>();
 
         // Act
         lsm.Put(100, 200);
@@ -71,12 +62,11 @@ public class LiteLsmTests
         Assert.That(value, Is.EqualTo(200));
     }
 
-    [TestCase(SkipListType.ClassBased)]
-    [TestCase(SkipListType.StructBased)]
-    public void TryGet_NonExistentKey_ReturnsFalse(SkipListType skipListType)
+    [Test]
+    public void TryGet_NonExistentKey_ReturnsFalse()
     {
         // Arrange
-        var lsm = CreateLsm<long, long>(skipListType);
+        var lsm = CreateLsm<long, long>();
         lsm.Put(100, 200);
 
         // Act
@@ -87,12 +77,11 @@ public class LiteLsmTests
         Assert.That(value, Is.EqualTo(0));
     }
 
-    [TestCase(SkipListType.ClassBased)]
-    [TestCase(SkipListType.StructBased)]
-    public void Put_MultipleValues_AllRetrievable(SkipListType skipListType)
+    [Test]
+    public void Put_MultipleValues_AllRetrievable()
     {
         // Arrange
-        var lsm = CreateLsm<long, long>(skipListType);
+        var lsm = CreateLsm<long, long>();
 
         // Act - insert 100 values
         for (long i = 1; i <= 100; i++)
@@ -109,19 +98,19 @@ public class LiteLsmTests
         }
     }
 
-    [TestCase(SkipListType.ClassBased)]
-    [TestCase(SkipListType.StructBased)]
-    public void QueryRange_ReturnsValuesInRange(SkipListType skipListType)
+    [Test]
+    public void Iterator_ReturnsValuesInRange()
     {
         // Arrange
-        var lsm = CreateLsm<long, long>(skipListType);
+        var lsm = CreateLsm<long, long>();
         for (long i = 1; i <= 20; i++)
         {
             lsm.Put(i, i * 100);
         }
 
         // Act
-        var results = lsm.QueryRange(5, 10).ToList();
+        using var iter = lsm.GetIterator(5, 10);
+        var results = iter.ReadAll().ToList();
 
         // Assert
         Assert.That(results.Count, Is.EqualTo(6)); // 5, 6, 7, 8, 9, 10
@@ -131,28 +120,27 @@ public class LiteLsmTests
         Assert.That(results[5].Value, Is.EqualTo(1000));
     }
 
-    [TestCase(SkipListType.ClassBased)]
-    [TestCase(SkipListType.StructBased)]
-    public void QueryRange_EmptyRange_ReturnsEmpty(SkipListType skipListType)
+    [Test]
+    public void Iterator_EmptyRange_ReturnsEmpty()
     {
         // Arrange
-        var lsm = CreateLsm<long, long>(skipListType);
+        var lsm = CreateLsm<long, long>();
         lsm.Put(1, 10);
         lsm.Put(10, 100);
 
         // Act
-        var results = lsm.QueryRange(2, 9).ToList();
+        using var iter = lsm.GetIterator(2, 9);
+        var results = iter.ReadAll().ToList();
 
         // Assert
         Assert.That(results, Is.Empty);
     }
 
-    [TestCase(SkipListType.ClassBased)]
-    [TestCase(SkipListType.StructBased)]
-    public void Put_MoreThanSegmentSize_AutoFlushesToDisk(SkipListType skipListType)
+    [Test]
+    public void Put_MoreThanSegmentSize_AutoFlushesToDisk()
     {
         // Arrange
-        var lsm = CreateLsm<long, long>(skipListType);
+        var lsm = CreateLsm<long, long>();
         int segmentSize = SegmentManager.SegmentSize;
 
         // Act - insert more than one segment worth of data
@@ -160,6 +148,7 @@ public class LiteLsmTests
         {
             lsm.Put(i, i * 2);
         }
+        lsm.WaitForPendingFlush();
 
         // Assert - all values should still be retrievable (some from disk)
         for (long i = 1; i <= segmentSize + 100; i++)
@@ -170,12 +159,11 @@ public class LiteLsmTests
         }
     }
 
-    [TestCase(SkipListType.ClassBased)]
-    [TestCase(SkipListType.StructBased)]
-    public void QueryRange_AfterFlush_ReturnsAllValues(SkipListType skipListType)
+    [Test]
+    public void Iterator_AfterFlush_ReturnsAllValues()
     {
         // Arrange
-        var lsm = CreateLsm<long, long>(skipListType);
+        var lsm = CreateLsm<long, long>();
         int segmentSize = SegmentManager.SegmentSize;
 
         // Insert enough data to trigger a flush
@@ -184,39 +172,39 @@ public class LiteLsmTests
         {
             lsm.Put(i, i * 3);
         }
+        lsm.WaitForPendingFlush();
 
-        // Act - query range spanning both on-disk and in-memory data
-        var results = lsm.QueryRange(500, totalInserts).ToList();
+        // Act - iterate range spanning both on-disk and in-memory data
+        using var iter = lsm.GetIterator(500, totalInserts);
+        var results = iter.ReadAll().ToList();
 
         // Assert - should get all values in range
         int expectedCount = totalInserts - 500 + 1; // 500 to totalInserts inclusive
         Assert.That(results.Count, Is.EqualTo(expectedCount));
-        Assert.That(results, Is.Ordered.By("Key"));
-        
-        // Verify first and last
+        Assert.That(results, Is.Ordered.By("Item1"));
         Assert.That(results[0].Key, Is.EqualTo(500));
         Assert.That(results[0].Value, Is.EqualTo(1500));
         Assert.That(results[^1].Key, Is.EqualTo(totalInserts));
         Assert.That(results[^1].Value, Is.EqualTo(totalInserts * 3));
     }
 
-    [TestCase(SkipListType.ClassBased)]
-    [TestCase(SkipListType.StructBased)]
-    public void QueryRange_EntireDataset_ReturnsSortedResults(SkipListType skipListType)
+    [Test]
+    public void Iterator_EntireDataset_ReturnsSortedResults()
     {
         // Arrange
-        var lsm = CreateLsm<long, long>(skipListType);
+        var lsm = CreateLsm<long, long>();
         for (long i = 1; i <= 100; i++)
         {
             lsm.Put(i, i * 7);
         }
 
         // Act
-        var results = lsm.QueryRange(1, 100).ToList();
+        using var iter = lsm.GetIterator(1, 100);
+        var results = iter.ReadAll().ToList();
 
         // Assert
         Assert.That(results.Count, Is.EqualTo(100));
-        Assert.That(results, Is.Ordered.By("Key"));
+        Assert.That(results, Is.Ordered.By("Item1"));
         
         for (int i = 0; i < 100; i++)
         {
@@ -225,12 +213,11 @@ public class LiteLsmTests
         }
     }
 
-    [TestCase(SkipListType.ClassBased)]
-    [TestCase(SkipListType.StructBased)]
-    public void TryGet_DifferentKeyValueTypes_WorksCorrectly(SkipListType skipListType)
+    [Test]
+    public void TryGet_DifferentKeyValueTypes_WorksCorrectly()
     {
         // Arrange
-        var lsm = CreateLsm<int, float>(skipListType);
+        var lsm = CreateLsm<int, float>();
 
         // Act
         lsm.Put(1, 1.5f);
@@ -248,12 +235,11 @@ public class LiteLsmTests
         Assert.That(v3, Is.EqualTo(3.5f));
     }
 
-    [TestCase(SkipListType.ClassBased)]
-    [TestCase(SkipListType.StructBased)]
-    public void GetStats_ReturnsCorrectCounts(SkipListType skipListType)
+    [Test]
+    public void GetStats_ReturnsCorrectCounts()
     {
         // Arrange
-        var lsm = CreateLsm<long, long>(skipListType);
+        var lsm = CreateLsm<long, long>();
         
         // Act - insert some data but not enough to flush
         for (long i = 1; i <= 100; i++)
@@ -268,12 +254,11 @@ public class LiteLsmTests
         Assert.That(stats.NumSegments, Is.EqualTo(0)); // No flush yet
     }
 
-    [TestCase(SkipListType.ClassBased)]
-    [TestCase(SkipListType.StructBased)]
-    public void GetStats_AfterFlush_ShowsSegments(SkipListType skipListType)
+    [Test]
+    public void GetStats_AfterFlush_ShowsSegments()
     {
         // Arrange
-        var lsm = CreateLsm<long, long>(skipListType);
+        var lsm = CreateLsm<long, long>();
         int segmentSize = SegmentManager.SegmentSize;
         
         // Act - trigger a flush
@@ -287,5 +272,123 @@ public class LiteLsmTests
 
         // Assert
         Assert.That(stats.NumSegments, Is.GreaterThan(0));
+    }
+
+    [Test]
+    public void ConcurrentReadsAndWrites_DataAlwaysConsistent()
+    {
+        // Long-running test: writer inserts monotonic keys while background readers
+        // continuously perform point queries and range queries. Verifies that
+        // all reads return correct data even during flushes.
+        var lsm = CreateLsm<long, long>();
+        const int totalInserts = 50_000; // Triggers many flushes (SegmentSize=1024)
+        var errors = new System.Collections.Concurrent.ConcurrentBag<string>();
+        var cts = new CancellationTokenSource();
+        long highWaterMark = 0; // Highest key fully committed by writer
+
+        // Writer: inserts keys 1..totalInserts monotonically
+        var writerTask = Task.Run(() =>
+        {
+            for (long i = 1; i <= totalInserts; i++)
+            {
+                lsm.Put(i, i * 10);
+                Volatile.Write(ref highWaterMark, i);
+            }
+            lsm.WaitForPendingFlush();
+            cts.Cancel();
+        });
+
+        // Reader 1: point queries on keys known to be written
+        var pointReader = Task.Run(() =>
+        {
+            var rng = new Random(42);
+            while (!cts.Token.IsCancellationRequested)
+            {
+                long hwm = Volatile.Read(ref highWaterMark);
+                if (hwm < 10) { Thread.Yield(); continue; }
+
+                long key = rng.NextInt64(1, hwm + 1);
+                if (lsm.TryGet(key, out long value))
+                {
+                    if (value != key * 10)
+                    {
+                        errors.Add($"TryGet({key}) returned {value}, expected {key * 10}");
+                    }
+                }
+                // Not finding the key is acceptable — it may be mid-flush
+            }
+        });
+
+        // Reader 2: range queries via iterator on committed data
+        var rangeReader = Task.Run(() =>
+        {
+            var rng = new Random(99);
+            while (!cts.Token.IsCancellationRequested)
+            {
+                long hwm = Volatile.Read(ref highWaterMark);
+                if (hwm < 100) { Thread.Yield(); continue; }
+
+                long from = rng.NextInt64(1, hwm - 10);
+                long to = Math.Min(from + rng.NextInt64(10, 500), hwm);
+
+                using var iter = lsm.GetIterator(from, to);
+                long? prevKey = null;
+                foreach (var (key, value) in iter.ReadAll())
+                {
+                    // Keys must be in ascending order
+                    if (prevKey.HasValue && key <= prevKey.Value)
+                    {
+                        errors.Add($"Range [{from},{to}]: key {key} not ascending after {prevKey.Value}");
+                        break;
+                    }
+
+                    // Keys must be within the requested range
+                    if (key < from || key > to)
+                    {
+                        errors.Add($"Range [{from},{to}]: key {key} out of bounds");
+                        break;
+                    }
+
+                    // Values must match the formula
+                    if (value != key * 10)
+                    {
+                        errors.Add($"Range [{from},{to}]: key {key} has value {value}, expected {key * 10}");
+                        break;
+                    }
+
+                    prevKey = key;
+                }
+            }
+        });
+
+        // Wait for all tasks
+        Task.WaitAll(writerTask, pointReader, rangeReader);
+
+        // Final verification: all keys must now be retrievable
+        for (long i = 1; i <= totalInserts; i++)
+        {
+            bool found = lsm.TryGet(i, out long val);
+            if (!found)
+                errors.Add($"Final check: key {i} not found");
+            else if (val != i * 10)
+                errors.Add($"Final check: key {i} has value {val}, expected {i * 10}");
+        }
+
+        // Final range query over entire dataset
+        using var fullIter = lsm.GetIterator(1, totalInserts);
+        var allResults = fullIter.ReadAll().ToList();
+        Assert.That(allResults.Count, Is.EqualTo(totalInserts),
+            $"Full range query returned {allResults.Count} entries, expected {totalInserts}");
+
+        for (int i = 0; i < allResults.Count; i++)
+        {
+            if (allResults[i].Key != i + 1)
+                errors.Add($"Full range: index {i} has key {allResults[i].Key}, expected {i + 1}");
+            if (allResults[i].Value != (i + 1) * 10)
+                errors.Add($"Full range: key {allResults[i].Key} has value {allResults[i].Value}, expected {(i + 1) * 10}");
+        }
+
+        Assert.That(errors, Is.Empty,
+            $"Found {errors.Count} error(s):\n{string.Join("\n", errors.Take(20))}");
     }
 }

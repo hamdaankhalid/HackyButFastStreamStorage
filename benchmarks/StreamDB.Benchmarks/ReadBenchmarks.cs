@@ -290,8 +290,10 @@ public class ReadBenchmarks
         // LiteLsm has no secondary indexes — query ~1000 entries to match other single-index reads
         long startPi = BasePi + 10_000;
         long endPi = startPi + 1000;
-        var results = _liteLsm.QueryRange(startPi, endPi).ToList();
-        return results.Count;
+        using var iter = _liteLsm.GetIterator(startPi, endPi);
+        int count = 0;
+        foreach (var _ in iter.ReadAll()) count++;
+        return count;
     }
 
     [Benchmark]
@@ -300,8 +302,10 @@ public class ReadBenchmarks
         // Comparable to multi-index reads: query ~4000 entries
         long startPi = BasePi + 10_000;
         long endPi = startPi + 4000;
-        var results = _liteLsm.QueryRange(startPi, endPi).ToList();
-        return results.Count;
+        using var iter = _liteLsm.GetIterator(startPi, endPi);
+        int count = 0;
+        foreach (var _ in iter.ReadAll()) count++;
+        return count;
     }
 
     [Benchmark]
@@ -310,8 +314,10 @@ public class ReadBenchmarks
         // All data in memtable — no disk I/O
         long startPi = BasePi + 10_000;
         long endPi = startPi + 1000;
-        var results = _liteLsmInMemory.QueryRange(startPi, endPi).ToList();
-        return results.Count;
+        using var iter = _liteLsmInMemory.GetIterator(startPi, endPi);
+        int count = 0;
+        foreach (var _ in iter.ReadAll()) count++;
+        return count;
     }
 
     [Benchmark]
@@ -319,7 +325,9 @@ public class ReadBenchmarks
     {
         long startPi = BasePi + 10_000;
         long endPi = startPi + 4000;
-        var results = _liteLsmInMemory.QueryRange(startPi, endPi).ToList();
-        return results.Count;
+        using var iter = _liteLsmInMemory.GetIterator(startPi, endPi);
+        int count = 0;
+        foreach (var _ in iter.ReadAll()) count++;
+        return count;
     }
 }

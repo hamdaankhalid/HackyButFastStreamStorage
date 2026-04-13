@@ -20,327 +20,283 @@ Thread-Safety:
 */
 namespace StreamDB.LiteLsm;
 
-/// <summary>
-/// Specifies which skip list implementation to use.
-/// </summary>
-public enum SkipListType
+public class LiteLsm<TKey, TValue> where TKey : unmanaged, IComparable<TKey> where TValue : unmanaged
 {
-  /// <summary>
-  /// Class-based skip list with ArrayPool optimization.
-  /// Good general-purpose choice with ~90% GC reduction.
-  /// </summary>
-  ClassBased,
-  
-  /// <summary>
-  /// Struct-based skip list with zero allocations.
-  /// Use for ultra-low latency / zero-GC requirements.
-  /// </summary>
-  StructBased
-}
+    private readonly IMonotonicSkipList<TKey, TValue>[] _skipLists;
+    private readonly SegmentManager _segmentManager;
+    private readonly int _memTableCapacity;
+    private int _activeSkipListIndex = 0;
+    private readonly int[] _skipListSessions = new int[2];  // Track active sessions per skiplist
+    private int _flushingSegmentIndex = -1;                 // Segment currently being flushed (-1 = none)
+    private readonly object _commitLock = new object();     // Uncontended lock for flush synchronization with other flush calls
+    private Task? _pendingFlush;                            // Background flush task
 
-class LiteLsm<TKey, TValue> where TKey : unmanaged, IComparable<TKey> where TValue : unmanaged
-{
-  private readonly IMonotonicSkipList<TKey, TValue>[] _skipLists;
-  private readonly SegmentManager _segmentManager;
-  private readonly int _memTableCapacity;
-  private int _activeSkipListIndex = 0;
-  private readonly int[] _skipListSessions = new int[2];  // Track active sessions per skiplist
-  private int _flushingSegmentIndex = -1;                 // Segment currently being flushed (-1 = none)
-  private readonly object _commitLock = new object();
-  private Task? _pendingFlush;                            // Background flush task
-
-  /// <summary>
-  /// Creates a new LiteLsm with a custom skip list factory.
-  /// Useful for testing or custom implementations.
-  /// </summary>
-  /// <param name="factory">Factory function that creates skip list instances.</param>
-  /// <param name="segmentDirectory">Directory for segment files.</param>
-  /// <param name="memTableCapacity">Number of entries before flushing to disk. Must match skip list capacity.</param>
-  public LiteLsm(Func<IMonotonicSkipList<TKey, TValue>> factory, string segmentDirectory = "segments", int memTableCapacity = SegmentManager.SegmentSize)
-  {
-    _memTableCapacity = memTableCapacity;
-    _skipLists = new IMonotonicSkipList<TKey, TValue>[2];
-    _skipLists[0] = factory();
-    _skipLists[1] = factory();
-    _segmentManager = new SegmentManager(segmentDirectory);
-  }
-
-  private static IMonotonicSkipList<TKey, TValue> CreateSkipList(SkipListType type)
-  {
-    return type switch
+    /// <summary>
+    /// Creates a new LiteLsm with a custom skip list factory.
+    /// Useful for testing or custom implementations.
+    /// </summary>
+    /// <param name="factory">Factory function that creates skip list instances.</param>
+    /// <param name="segmentDirectory">Directory for segment files.</param>
+    /// <param name="memTableCapacity">Number of entries before flushing to disk. Must match skip list capacity.</param>
+    public LiteLsm(Func<IMonotonicSkipList<TKey, TValue>> factory, string segmentDirectory = "segments", int memTableCapacity = SegmentManager.SegmentSize)
     {
-      SkipListType.ClassBased => new SkipList<TKey, TValue>(maxCapacity: SegmentManager.SegmentSize),
-      SkipListType.StructBased => new StructSkipList<TKey, TValue>(maxCapacity: SegmentManager.SegmentSize),
-      _ => throw new ArgumentException($"Unknown skip list type: {type}", nameof(type))
-    };
-  }
-
-  public void Put(TKey key, TValue value)
-  {
-    int activeIndex = EnterSkipListSession();
-    bool needsFlush;
-    try
-    { 
-      _skipLists[activeIndex].InsertMonotonic(key, value);
-      needsFlush = _skipLists[activeIndex].Count >= _memTableCapacity;
-    }
-    finally
-    {
-      ExitSkipListSession(activeIndex);
+        _memTableCapacity = memTableCapacity;
+        _skipLists = new IMonotonicSkipList<TKey, TValue>[2];
+        _skipLists[0] = factory();
+        _skipLists[1] = factory();
+        _segmentManager = new SegmentManager(segmentDirectory);
     }
 
-    // Auto-flush must happen outside session tracking to avoid self-deadlock:
-    // Commit() waits for _skipListSessions to drain to zero, so the calling
-    // thread must not be holding a session count.
-    if (needsFlush)
+    public void Put(TKey key, TValue value)
     {
-      Commit();
-    }
-  }
-
-  private void Commit()
-  {
-    // Try to acquire the lock; if someone else is already flushing, just return. This is not a common case so this lock will be very much uncontended
-    if (!Monitor.TryEnter(_commitLock))
-    {
-      return;
-    }
-
-    try
-    {
-      // If a previous flush is still running, we must wait — both buffers are in use
-      _pendingFlush?.Wait();
-
-      int currentIndex = Volatile.Read(ref _activeSkipListIndex);
-      var skipListToFlush = _skipLists[currentIndex];
-
-      if (skipListToFlush.Count == 0)
-      {
-        return;
-      }
-
-      int nextIndex = (currentIndex + 1) % 2;
-      
-      // Switch to the other skiplist atomically
-      // After this point, new writes go to the other skiplist
-      Volatile.Write(ref _activeSkipListIndex, nextIndex);
-
-      // Memory barrier to ensure all threads see the index switch
-      Thread.MemoryBarrier();
-
-      // Wait for all active sessions on the old skiplist to complete
-      // This ensures no thread is in the middle of Put() using the old skiplist
-      while (Volatile.Read(ref _skipListSessions[currentIndex]) > 0)
-      {
-        Thread.Yield();
-      }
-
-      // Launch flush on background thread so the writer is not blocked by disk I/O
-      int segmentIndex = _segmentManager.NumSegments;
-      _pendingFlush = Task.Run(() =>
-      {
-        Interlocked.Exchange(ref _flushingSegmentIndex, segmentIndex);
-        
-        _segmentManager.Flush<TKey, TValue>(skipListToFlush);
-        
-        Interlocked.Exchange(ref _flushingSegmentIndex, -1);
-
-        // Wait for any TryGet readers still scanning this skiplist before clearing
-        while (Volatile.Read(ref _skipListSessions[currentIndex]) > 0)
+        int activeIndex = EnterSkipListSession();
+        bool needsFlush;
+        try
         {
-          Thread.Yield();
+            _skipLists[activeIndex].InsertMonotonic(key, value);
+            needsFlush = _skipLists[activeIndex].Count >= _memTableCapacity;
         }
-        
-        skipListToFlush.Clear();
-      });
-    }
-    finally
-    {
-      Monitor.Exit(_commitLock);
-    }
-  }
+        finally
+        {
+            ExitSkipListSession(activeIndex);
+        }
 
-  public void WaitForPendingFlush() => _pendingFlush?.Wait();
-
-  /// <summary>
-  /// Tries to get a value by key. Uses binary search to find the correct segment,
-  /// then handles in-memory, flushing, or flushed states.
-  /// </summary>
-  public bool TryGet(TKey key, out TValue value)
-  {
-    value = default;
-
-    // Check active skiplist first
-    int activeIndex = Volatile.Read(ref _activeSkipListIndex);
-    Interlocked.Increment(ref _skipListSessions[activeIndex]);
-    try
-    {
-      if (_skipLists[activeIndex].TryGetValue(key, out value))
-      {
-        return true;
-      }
-    }
-    finally
-    {
-      ExitSkipListSession(activeIndex);
+        // Auto-flush must happen outside session tracking to avoid self-deadlock:
+        // Commit() waits for _skipListSessions to drain to zero, so the calling
+        // thread must not be holding a session count.
+        if (needsFlush)
+        {
+            Commit();
+        }
     }
 
-    // Check the other skiplist (might be in the process of flushing)
-    int otherIndex = (activeIndex + 1) % 2;
-    Interlocked.Increment(ref _skipListSessions[otherIndex]);
-    try
+    private void Commit()
     {
-      if (_skipLists[otherIndex].TryGetValue(key, out value))
-      {
-        return true;
-      }
-    }
-    finally
-    {
-      Interlocked.Decrement(ref _skipListSessions[otherIndex]);
-    }
+        // Try to acquire the lock; if someone else is already flushing, just return. This is not a common case so this lock will be very much uncontended
+        if (!Monitor.TryEnter(_commitLock))
+        {
+            return;
+        }
 
-    // Not in memory, find the segment on disk that might contain the key
-    if (_segmentManager.NumSegments == _segmentManager.BeginSegmentIndex)
-    {
-      return false; // No segments on disk
-    }
+        try
+        {
+            // If a previous flush is still running, we must wait — both buffers are in use
+            _pendingFlush?.Wait();
 
-    // Use SegmentManager to find the segment that might contain the key
-    int targetSegment = _segmentManager.FindSegmentForKey(key);
-    
-    if (targetSegment == -1)
-    {
-      return false;
-    }
+            int currentIndex = Volatile.Read(ref _activeSkipListIndex);
+            var skipListToFlush = _skipLists[currentIndex];
 
-    // Check if this segment is currently being flushed
-    int flushingSegment = Interlocked.CompareExchange(ref _flushingSegmentIndex, -1, -1);
-    if (targetSegment == flushingSegment)
-    {
-      // Wait for flush to complete
-      while (Interlocked.CompareExchange(ref _flushingSegmentIndex, -1, -1) == targetSegment)
-      {
-        Thread.Yield();
-      }
-    }
+            if (skipListToFlush.Count == 0)
+            {
+                return;
+            }
 
-    // Read from the segment file
-    return _segmentManager.TryGetFromSegment(targetSegment, key, out value);
-  }
+            int nextIndex = (currentIndex + 1) % 2;
 
-  /// <summary>
-  /// Iterator for range queries. Yields entries in sorted order across memory and disk.
-  /// Since keys are strictly monotonic, no deduplication is needed.
-  /// </summary>
-  public IEnumerable<KeyValuePair<TKey, TValue>> QueryRange(TKey startKey, TKey endKey)
-  {
-    // Snapshot the active index to ensure consistency during iteration
-    int activeIndex = Volatile.Read(ref _activeSkipListIndex);
-    int otherIndex = (activeIndex + 1) % 2;
+            // Switch to the other skiplist atomically
+            // After this point, new writes go to the other skiplist
+            Volatile.Write(ref _activeSkipListIndex, nextIndex);
 
-    // see where the startKey falls in segments
-    int segmentIndex = _segmentManager.FindSegmentForKey(startKey);
+            // Memory barrier to ensure all threads see the index switch
+            Thread.MemoryBarrier();
 
-    if (segmentIndex == -1)
-    {
-      // No segments, just yield from memory
-      foreach (var kvp in _skipLists[activeIndex].GetRange(startKey, endKey))
-      {
-        yield return kvp;
-      }
-      foreach (var kvp in _skipLists[otherIndex].GetRange(startKey, endKey))
-      {
-        yield return kvp;
-      }
-    }
-    else
-    {
-      // Yield from segments first, then memory
-      foreach (var kvp in _segmentManager.QuerySegmentRange(segmentIndex, startKey, endKey))
-      {
-        yield return kvp;
-      }
+            // Wait for all active sessions on the old skiplist to complete
+            // This ensures no thread is in the middle of Put() using the old skiplist
+            while (Volatile.Read(ref _skipListSessions[currentIndex]) > 0)
+            {
+                Thread.Yield();
+            }
 
-      foreach (var kvp in _skipLists[activeIndex].GetRange(startKey, endKey))
-      {
-        yield return kvp;
-      }
-      
-      foreach (var kvp in _skipLists[otherIndex].GetRange(startKey, endKey))
-      {
-        yield return kvp;
-      }
-    }
-  }
+            // Launch flush on background thread so the writer is not blocked by disk I/O
+            int segmentIndex = _segmentManager.NumSegments;
+            _pendingFlush = Task.Run(() =>
+            {
+                Interlocked.Exchange(ref _flushingSegmentIndex, segmentIndex);
 
-  /// <summary>
-  /// Gets statistics about the LSM tree.
-  /// </summary>
-  public LsmStats GetStats()
-  {
-    int activeIndex = Volatile.Read(ref _activeSkipListIndex);
-    return new LsmStats
-    {
-      ActiveMemTableCount = _skipLists[activeIndex].Count,
-      InactiveMemTableCount = _skipLists[(activeIndex + 1) % 2].Count,
-      NumSegments = _segmentManager.NumSegments - _segmentManager.BeginSegmentIndex,
-      EarliestSegmentIndex = _segmentManager.BeginSegmentIndex,
-      LatestSegmentIndex = _segmentManager.NumSegments - 1
-    };
-  }
+                _segmentManager.Flush<TKey, TValue>(skipListToFlush);
 
-  /// <summary>
-  /// Truncates all segments whose keys are strictly less than the given key.
-  /// Frees disk space by deleting fully-truncated segment files.
-  /// Only affects on-disk segments; in-memory data is not modified.
-  /// </summary>
-  public int Truncate(TKey beforeKey)
-  {
-    WaitForPendingFlush();
+                Interlocked.Exchange(ref _flushingSegmentIndex, -1);
 
-    int newBegin = _segmentManager.BeginSegmentIndex;
+                // Wait for any TryGet readers still scanning this skiplist before clearing
+                while (Volatile.Read(ref _skipListSessions[currentIndex]) > 0)
+                {
+                    Thread.Yield();
+                }
 
-    // Walk segments from oldest to newest, truncating those entirely below beforeKey
-    for (int i = _segmentManager.BeginSegmentIndex; i < _segmentManager.NumSegments; i++)
-    {
-      if (_segmentManager.TryGetSegmentMaxKey<TKey>(i, out TKey maxKey) && maxKey.CompareTo(beforeKey) < 0)
-      {
-        newBegin = i + 1;
-      }
-      else
-      {
-        break; // Keys are monotonic, so all subsequent segments have higher keys
-      }
+                skipListToFlush.Clear();
+            });
+        }
+        finally
+        {
+            Monitor.Exit(_commitLock);
+        }
     }
 
-    int truncated = newBegin - _segmentManager.BeginSegmentIndex;
-    if (truncated > 0)
-    {
-      _segmentManager.TruncateBefore(newBegin);
-    }
-    return truncated;
-  }
+    public void WaitForPendingFlush() => _pendingFlush?.Wait();
 
-  // Every method that accesses the skiplist for reading or writing must call TryEnter() at the beginning to ensure it doesn't run concurrently with a flush that is clearing the skiplist. 
-  private int EnterSkipListSession()
-  {
-    while (true)
+    // used by iterators to read batches
+    internal (bool _hasMoreBatchesToRead, int _bufferedBatchCount)
+        ReadBatchInto(TKey readFrom, TKey endKey, Span<(TKey, TValue)> bufferedBatch, bool excludeStart = false)
     {
-      int activeIndex = Volatile.Read(ref _activeSkipListIndex);
-      Interlocked.Increment(ref _skipListSessions[activeIndex]);
-      // if the active skipist got switched between our read and increment then 
-      // we need to redo the increment on the new active skiplist after we decrement the old one
-      if (Volatile.Read(ref _activeSkipListIndex) == activeIndex)
-      {
-        return activeIndex;
-      }
-      else
-      {
-        Interlocked.Decrement(ref _skipListSessions[activeIndex]);
-      }
-    }
-  }
+        int totalRead = 0;
 
-  private void ExitSkipListSession(int sessionIdx) => Interlocked.Decrement(ref _skipListSessions[sessionIdx]);
+        // Step 1: Try on-disk segments first (contain older/lower keys due to monotonic ordering)
+        var segResult = _segmentManager.ReadRangeFromSegment<TKey, TValue>(readFrom, endKey, bufferedBatch, excludeStart);
+        totalRead = segResult.EntriesRead;
+
+        // If buffer is full or segments signaled more data within range, return
+        if (totalRead >= bufferedBatch.Length || segResult.HasMore)
+        {
+            return (true, totalRead);
+        }
+
+        // Step 2: Segments exhausted or partially filled — try active memtable for continuation.
+        // MemCpyRawRange handles the case where readFrom < memMinKey by starting from the first valid node.
+        // If we already read segment data, the memtable keys are strictly greater (monotonic),
+        // so excludeStart only applies if no segment data was read.
+        bool memExcludeStart = excludeStart && totalRead == 0;
+        int activeIdx = EnterSkipListSession();
+        try
+        {
+            IMonotonicSkipList<TKey, TValue> skipList = _skipLists[activeIdx];
+            if (skipList.Count > 0)
+            {
+                var remaining = bufferedBatch.Slice(totalRead);
+                var memResult = skipList.MemCpyRawRange(readFrom, endKey, remaining, memExcludeStart);
+                totalRead += memResult.Item2;
+                return (memResult.Item1, totalRead);
+            }
+        }
+        finally
+        {
+            ExitSkipListSession(activeIdx);
+        }
+
+        return (false, totalRead);
+    }
+
+
+    /// <summary>
+    /// Create an iterator to read ranges of keys and values via IEnumerable interface.
+    /// This allows you to read large ranges. The iterator will read in batches of the specified size to minimize memory usage.
+    /// </summary>
+    /// <param name="fromKey"></param>
+    /// <param name="endKey"></param>
+    /// <param name="batchSize"></param>
+    /// <returns></returns>
+    public LiteLsmIterator<TKey, TValue> GetIterator(TKey fromKey, TKey endKey, int batchSize = 256) => new LiteLsmIterator<TKey, TValue>(this, fromKey, endKey, batchSize);
+
+    /// <summary>
+    /// Tries to get a value by key. Uses binary search to find the correct segment,
+    /// then handles in-memory, flushing, or flushed states.
+    /// </summary>
+    public bool TryGet(TKey key, out TValue value)
+    {
+        value = default;
+
+        // Case 0: key in memory. Search in memory via fast ProbablyContainsKey first.
+        int activeIdx = EnterSkipListSession();
+        bool foundInActive = TryGetKeyFromMemory(_skipLists[activeIdx], key, out value);
+        ExitSkipListSession(activeIdx);
+        if (foundInActive)
+        {
+            return true;
+        }
+
+        // No active session lock is held since we are searching for segments on disk at this point
+        int segmentIdx = _segmentManager.FindSegmentForKey(key);
+        // TODO: Above segment manager method uses binary search but it won't be able to read when a segment file is actively being flushed.
+        // This means we cannot really get to checking if we are reading from a segment mid-flush... This is a bug I will fix later
+
+        // Case 1: The segment is actively being flushed. Wait for the flush to complete. Then read from disk
+        if (IsFlushingSegment(segmentIdx))
+        {
+            WaitForPendingFlush();
+        }
+
+        // Case 2: Key falls within a segment, try to read from disk
+        return _segmentManager.TryGetFromSegment<TKey, TValue>(segmentIdx, key, out value);
+    }
+
+    private bool TryGetKeyFromMemory(IMonotonicSkipList<TKey, TValue> skipList, TKey key, out TValue value)
+    {
+        value = default;
+        if (!skipList.ProbablyContainsKey(key))
+        {
+            return false;
+        }
+        return skipList.TryGetValue(key, out value);
+    }
+
+    private bool IsFlushingSegment(int segmentIndex) => Volatile.Read(ref _flushingSegmentIndex) == segmentIndex;
+
+    /// <summary>
+    /// Gets statistics about the LSM tree.
+    /// </summary>
+    public LsmStats GetStats()
+    {
+        int activeIndex = Volatile.Read(ref _activeSkipListIndex);
+        return new LsmStats
+        {
+            ActiveMemTableCount = _skipLists[activeIndex].Count,
+            InactiveMemTableCount = _skipLists[(activeIndex + 1) % 2].Count,
+            NumSegments = _segmentManager.NumSegments - _segmentManager.BeginSegmentIndex,
+            EarliestSegmentIndex = _segmentManager.BeginSegmentIndex,
+            LatestSegmentIndex = _segmentManager.NumSegments - 1
+        };
+    }
+
+    /// <summary>
+    /// Truncates all segments whose keys are strictly less than the given key.
+    /// Frees disk space by deleting fully-truncated segment files.
+    /// Only affects on-disk segments; in-memory data is not modified.
+    /// </summary>
+    public int Truncate(TKey beforeKey)
+    {
+        WaitForPendingFlush();
+
+        int newBegin = _segmentManager.BeginSegmentIndex;
+
+        // Walk segments from oldest to newest, truncating those entirely below beforeKey
+        for (int i = _segmentManager.BeginSegmentIndex; i < _segmentManager.NumSegments; i++)
+        {
+            if (_segmentManager.TryGetSegmentMaxKey<TKey>(i, out TKey maxKey) && maxKey.CompareTo(beforeKey) < 0)
+            {
+                newBegin = i + 1;
+            }
+            else
+            {
+                break; // Keys are monotonic, so all subsequent segments have higher keys
+            }
+        }
+
+        int truncated = newBegin - _segmentManager.BeginSegmentIndex;
+        if (truncated > 0)
+        {
+            _segmentManager.TruncateBefore(newBegin);
+        }
+        return truncated;
+    }
+
+    // Every method that accesses the skiplist for reading or writing must call TryEnter() at the beginning to ensure it doesn't run concurrently with a flush that is clearing the skiplist. 
+    private int EnterSkipListSession()
+    {
+        while (true)
+        {
+            int activeIndex = Volatile.Read(ref _activeSkipListIndex);
+            Interlocked.Increment(ref _skipListSessions[activeIndex]);
+            // if the active skipist got switched between our read and increment then 
+            // we need to redo the increment on the new active skiplist after we decrement the old one
+            if (Volatile.Read(ref _activeSkipListIndex) == activeIndex)
+            {
+                return activeIndex;
+            }
+            else
+            {
+                Interlocked.Decrement(ref _skipListSessions[activeIndex]);
+            }
+        }
+    }
+
+    private void ExitSkipListSession(int sessionIdx) => Interlocked.Decrement(ref _skipListSessions[sessionIdx]);
 }

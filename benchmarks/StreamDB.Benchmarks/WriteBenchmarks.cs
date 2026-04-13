@@ -183,6 +183,7 @@ public class WriteBenchmarks
         {
             _liteLsm.Put(1_000_000 + i, payload);
         }
+        _liteLsm.WaitForPendingFlush();
     }
 
     private static void TryDelete(string? path)
