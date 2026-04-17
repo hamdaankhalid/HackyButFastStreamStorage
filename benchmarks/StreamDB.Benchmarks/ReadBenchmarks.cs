@@ -60,12 +60,12 @@ public class ReadBenchmarks
         Directory.CreateDirectory(_sqliteDir);
         _sqliteConn = new SqliteConnection($"Data Source={Path.Combine(_sqliteDir, "bench.db")}");
         _sqliteConn.Open();
-        using (var pragma = _sqliteConn.CreateCommand())
+        using (SqliteCommand pragma = _sqliteConn.CreateCommand())
         {
             pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;";
             pragma.ExecuteNonQuery();
         }
-        using (var create = _sqliteConn.CreateCommand())
+        using (SqliteCommand create = _sqliteConn.CreateCommand())
         {
             create.CommandText = """
                 CREATE TABLE IF NOT EXISTS data (
@@ -78,13 +78,13 @@ public class ReadBenchmarks
                 """;
             create.ExecuteNonQuery();
         }
-        using (var tx = _sqliteConn.BeginTransaction())
+        using (SqliteTransaction tx = _sqliteConn.BeginTransaction())
         {
-            using var cmd = _sqliteConn.CreateCommand();
+            using SqliteCommand cmd = _sqliteConn.CreateCommand();
             cmd.Transaction = tx;
             cmd.CommandText = "INSERT INTO data (secondary_index, primary_index, version, payload) VALUES ($sidx, $pi, $ver, $payload)";
-            var pSidx = cmd.Parameters.Add("$sidx", SqliteType.Integer);
-            var pPi = cmd.Parameters.Add("$pi", SqliteType.Integer);
+      SqliteParameter pSidx = cmd.Parameters.Add("$sidx", SqliteType.Integer);
+      SqliteParameter pPi = cmd.Parameters.Add("$pi", SqliteType.Integer);
             cmd.Parameters.AddWithValue("$ver", 1);
             cmd.Parameters.AddWithValue("$payload", payloadBytes);
             cmd.Prepare();
@@ -99,7 +99,7 @@ public class ReadBenchmarks
 
         // RocksDB setup
         _rocksDir = Path.Combine(baseTmp, "rocks");
-        var options = new DbOptions().SetCreateIfMissing(true);
+    DbOptions options = new DbOptions().SetCreateIfMissing(true);
         _rocksDb = RocksDb.Open(options, _rocksDir);
         Span<byte> keyBuffer = stackalloc byte[12];
         using (var batch = new WriteBatch())
@@ -120,7 +120,6 @@ public class ReadBenchmarks
         Directory.CreateDirectory(_liteLsmDir);
         const int lsmCapacity = 32_768;
         _liteLsm = new LiteLsm<long, BenchPayload>(
-            () => new StructSkipList<long, BenchPayload>(lsmCapacity),
             Path.Combine(_liteLsmDir, "segments"),
             memTableCapacity: lsmCapacity);
         var lsmPayload = new BenchPayload { Latitude = 37.77, Longitude = -122.42, Speed = 60.0f, Heading = 90.0f };
@@ -132,7 +131,6 @@ public class ReadBenchmarks
         Directory.CreateDirectory(liteLsmInMemDir);
         const int inMemCapacity = TotalRecords + 1;
         _liteLsmInMemory = new LiteLsm<long, BenchPayload>(
-            () => new StructSkipList<long, BenchPayload>(inMemCapacity),
             Path.Combine(liteLsmInMemDir, "segments"),
             memTableCapacity: inMemCapacity);
         for (int i = 0; i < TotalRecords; i++)
@@ -160,7 +158,7 @@ public class ReadBenchmarks
         // Read 1000 entries for secondary index 0
         long startPi = BasePi + 10_000;
         long endPi = startPi + 4000; // ~1000 entries at stride 4
-        var results = _streamDb.ReadRange(secondaryIndex: 0, startPrimaryIndex: startPi, endPrimaryIndex: endPi);
+    List<StreamEntry> results = _streamDb.ReadRange(secondaryIndex: 0, startPrimaryIndex: startPi, endPrimaryIndex: endPi);
         return results.Count;
     }
 
@@ -184,13 +182,13 @@ public class ReadBenchmarks
     {
         long startPi = BasePi + 10_000;
         long endPi = startPi + 4000;
-        using var cmd = _sqliteConn.CreateCommand();
+        using SqliteCommand cmd = _sqliteConn.CreateCommand();
         cmd.CommandText = "SELECT primary_index, secondary_index, version, payload FROM data WHERE secondary_index = 0 AND primary_index >= $start AND primary_index <= $end ORDER BY primary_index";
         cmd.Parameters.AddWithValue("$start", startPi);
         cmd.Parameters.AddWithValue("$end", endPi);
 
         int count = 0;
-        using var reader = cmd.ExecuteReader();
+        using SqliteDataReader reader = cmd.ExecuteReader();
         while (reader.Read()) count++;
         return count;
     }
@@ -210,7 +208,7 @@ public class ReadBenchmarks
         MemoryMarshal.Write(endKey.AsSpan(4), in endPi);
 
         int count = 0;
-        using var iter = _rocksDb.NewIterator();
+        using Iterator iter = _rocksDb.NewIterator();
         iter.Seek(startKey);
         while (iter.Valid())
         {
@@ -231,7 +229,7 @@ public class ReadBenchmarks
         // Read across all 4 secondary indexes in one call — StreamDB groups by shard
         long startPi = BasePi + 10_000;
         long endPi = startPi + 4000;
-        var results = _streamDb.ReadRange(
+    Dictionary<int, List<StreamEntry>> results = _streamDb.ReadRange(
             secondaryIndexes: new[] { 0, 1, 2, 3 },
             startPrimaryIndex: startPi,
             endPrimaryIndex: endPi);
@@ -243,13 +241,13 @@ public class ReadBenchmarks
     {
         long startPi = BasePi + 10_000;
         long endPi = startPi + 4000;
-        using var cmd = _sqliteConn.CreateCommand();
+        using SqliteCommand cmd = _sqliteConn.CreateCommand();
         cmd.CommandText = "SELECT primary_index, secondary_index, version, payload FROM data WHERE secondary_index IN (0,1,2,3) AND primary_index >= $start AND primary_index <= $end ORDER BY secondary_index, primary_index";
         cmd.Parameters.AddWithValue("$start", startPi);
         cmd.Parameters.AddWithValue("$end", endPi);
 
         int count = 0;
-        using var reader = cmd.ExecuteReader();
+        using SqliteDataReader reader = cmd.ExecuteReader();
         while (reader.Read()) count++;
         return count;
     }
@@ -268,7 +266,7 @@ public class ReadBenchmarks
             MemoryMarshal.Write(startKey.AsSpan(), in sidx);
             MemoryMarshal.Write(startKey.AsSpan(4), in startPi);
 
-            using var iter = _rocksDb.NewIterator();
+            using Iterator iter = _rocksDb.NewIterator();
             iter.Seek(startKey);
             while (iter.Valid())
             {
@@ -290,9 +288,9 @@ public class ReadBenchmarks
         // LiteLsm has no secondary indexes — query ~1000 entries to match other single-index reads
         long startPi = BasePi + 10_000;
         long endPi = startPi + 1000;
-        using var iter = _liteLsm.GetIterator(startPi, endPi);
+        using LiteLsmIterator<long, BenchPayload> iter = _liteLsm.GetIterator(startPi, endPi);
         int count = 0;
-        foreach (var _ in iter.ReadAll()) count++;
+        foreach (KeyValuePair<long, BenchPayload> _ in iter.ReadAll()) count++;
         return count;
     }
 
@@ -302,9 +300,9 @@ public class ReadBenchmarks
         // Comparable to multi-index reads: query ~4000 entries
         long startPi = BasePi + 10_000;
         long endPi = startPi + 4000;
-        using var iter = _liteLsm.GetIterator(startPi, endPi);
+        using LiteLsmIterator<long, BenchPayload> iter = _liteLsm.GetIterator(startPi, endPi);
         int count = 0;
-        foreach (var _ in iter.ReadAll()) count++;
+        foreach (KeyValuePair<long, BenchPayload> _ in iter.ReadAll()) count++;
         return count;
     }
 
@@ -314,9 +312,9 @@ public class ReadBenchmarks
         // All data in memtable — no disk I/O
         long startPi = BasePi + 10_000;
         long endPi = startPi + 1000;
-        using var iter = _liteLsmInMemory.GetIterator(startPi, endPi);
+        using LiteLsmIterator<long, BenchPayload> iter = _liteLsmInMemory.GetIterator(startPi, endPi);
         int count = 0;
-        foreach (var _ in iter.ReadAll()) count++;
+        foreach (KeyValuePair<long, BenchPayload> _ in iter.ReadAll()) count++;
         return count;
     }
 
@@ -325,9 +323,9 @@ public class ReadBenchmarks
     {
         long startPi = BasePi + 10_000;
         long endPi = startPi + 4000;
-        using var iter = _liteLsmInMemory.GetIterator(startPi, endPi);
+        using LiteLsmIterator<long, BenchPayload> iter = _liteLsmInMemory.GetIterator(startPi, endPi);
         int count = 0;
-        foreach (var _ in iter.ReadAll()) count++;
+        foreach (KeyValuePair<long, BenchPayload> _ in iter.ReadAll()) count++;
         return count;
     }
 }

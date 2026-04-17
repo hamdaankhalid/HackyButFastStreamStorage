@@ -58,10 +58,10 @@ public class ConcurrentWriteBenchmarks
         Directory.CreateDirectory(_sqliteDir);
         _sqliteConn = new SqliteConnection($"Data Source={Path.Combine(_sqliteDir, "bench.db")}");
         _sqliteConn.Open();
-        using var pragma = _sqliteConn.CreateCommand();
+        using SqliteCommand pragma = _sqliteConn.CreateCommand();
         pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;";
         pragma.ExecuteNonQuery();
-        using var create = _sqliteConn.CreateCommand();
+        using SqliteCommand create = _sqliteConn.CreateCommand();
         create.CommandText = """
             CREATE TABLE IF NOT EXISTS data (
                 secondary_index INTEGER NOT NULL,
@@ -74,7 +74,7 @@ public class ConcurrentWriteBenchmarks
         create.ExecuteNonQuery();
 
         _rocksDir = Path.Combine(baseTmp, $"rocks-{Guid.NewGuid():N}");
-        var options = new DbOptions().SetCreateIfMissing(true);
+    DbOptions options = new DbOptions().SetCreateIfMissing(true);
         _rocksDb = RocksDb.Open(options, _rocksDir);
         _syncWriteOptions = new WriteOptions().SetSync(true);
     }
@@ -123,12 +123,12 @@ public class ConcurrentWriteBenchmarks
                 int end = Math.Min(start + batchSize, WritesPerDevice);
                 lock (_sqliteLock)
                 {
-                    using var tx = _sqliteConn.BeginTransaction();
-                    using var cmd = _sqliteConn.CreateCommand();
+                    using SqliteTransaction tx = _sqliteConn.BeginTransaction();
+                    using SqliteCommand cmd = _sqliteConn.CreateCommand();
                     cmd.Transaction = tx;
                     cmd.CommandText = "INSERT INTO data (secondary_index, primary_index, version, payload) VALUES ($sidx, $pi, $ver, $payload)";
-                    var pSidx = cmd.Parameters.Add("$sidx", SqliteType.Integer);
-                    var pPi = cmd.Parameters.Add("$pi", SqliteType.Integer);
+              SqliteParameter pSidx = cmd.Parameters.Add("$sidx", SqliteType.Integer);
+              SqliteParameter pPi = cmd.Parameters.Add("$pi", SqliteType.Integer);
                     cmd.Parameters.AddWithValue("$ver", 1);
                     cmd.Parameters.AddWithValue("$payload", _payloadBytes);
                     cmd.Prepare();
