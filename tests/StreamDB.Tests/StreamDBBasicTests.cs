@@ -52,7 +52,7 @@ public class StreamDBBasicTests
             AppendPayload(1, 100 + i);
 
         _db.WaitForPendingWrites();
-        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 109);
+    List<StreamEntry> results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 109);
 
         Assert.That(results, Has.Count.EqualTo(10));
         Assert.That(results[0].PrimaryIndex, Is.EqualTo(100));
@@ -65,7 +65,7 @@ public class StreamDBBasicTests
         AppendPayload(1, 100);
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 200, endPrimaryIndex: 300);
+    List<StreamEntry> results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 200, endPrimaryIndex: 300);
         Assert.That(results, Is.Empty);
     }
 
@@ -75,7 +75,7 @@ public class StreamDBBasicTests
         AppendPayload(1, 100);
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(secondaryIndex: 999, startPrimaryIndex: 0, endPrimaryIndex: 200);
+    List<StreamEntry> results = _db.ReadRange(secondaryIndex: 999, startPrimaryIndex: 0, endPrimaryIndex: 200);
         Assert.That(results, Is.Empty);
     }
 
@@ -86,7 +86,7 @@ public class StreamDBBasicTests
             AppendPayload(1, 100 + i);
 
         _db.WaitForPendingWrites();
-        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 200, limit: 5);
+    List<StreamEntry> results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 200, limit: 5);
 
         Assert.That(results, Has.Count.EqualTo(5));
         Assert.That(results[0].PrimaryIndex, Is.EqualTo(100));
@@ -101,8 +101,8 @@ public class StreamDBBasicTests
         AppendPayload(1, 300);
         _db.WaitForPendingWrites();
 
-        // Exact boundary match
-        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 300);
+    // Exact boundary match
+    List<StreamEntry> results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 300);
         Assert.That(results, Has.Count.EqualTo(3));
 
         // Start at exact primary index
@@ -120,7 +120,7 @@ public class StreamDBBasicTests
         AppendPayload(1, 100);
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 100);
+    List<StreamEntry> results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 100);
         Assert.That(results, Has.Count.EqualTo(1));
         Assert.That(results[0].PrimaryIndex, Is.EqualTo(100));
     }
@@ -134,7 +134,7 @@ public class StreamDBBasicTests
         AppendPayload(1, 100, value: 42.5f);
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 100);
+    List<StreamEntry> results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 100);
         Assert.That(results, Has.Count.EqualTo(1));
 
         TestPayload p = registry.Deserialize<TestPayload>(results[0]);
@@ -149,7 +149,7 @@ public class StreamDBBasicTests
         AppendPayload(1, 200, version: 2);
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 200);
+    List<StreamEntry> results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 200);
         Assert.That(results, Has.Count.EqualTo(2));
         Assert.That(results[0].Version, Is.EqualTo(1));
         Assert.That(results[1].Version, Is.EqualTo(2));
@@ -208,7 +208,7 @@ public class StreamDBBasicTests
         _db.ReadRangePooled(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 100,
             (in StreamEntryView entry) =>
             {
-                var p = MemoryMarshal.Read<TestPayload>(entry.Payload);
+              TestPayload p = MemoryMarshal.Read<TestPayload>(entry.Payload);
                 capturedValue = p.Value;
                 return true;
             });

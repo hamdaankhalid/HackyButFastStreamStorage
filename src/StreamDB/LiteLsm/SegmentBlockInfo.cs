@@ -1,10 +1,13 @@
 
+using System.Runtime.InteropServices;
+
 namespace StreamDB.LiteLsm;
 
 /// <summary>
 /// Metadata for a commit block within a segment file.
 /// </summary>
-internal readonly struct SegmentBlockInfo
+[StructLayout(LayoutKind.Sequential, Pack = 1, Size = 24)]
+public readonly struct SegmentBlockInfo
 {
   public readonly int BlockId { get; init; }
   public readonly int FileId { get; init; }

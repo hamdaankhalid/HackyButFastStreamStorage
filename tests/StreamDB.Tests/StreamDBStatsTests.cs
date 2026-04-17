@@ -41,7 +41,7 @@ public class StreamDBStatsTests
     [Test]
     public void GetStats_InitialValues()
     {
-        var stats = _db.GetStats();
+    StreamDbStats stats = _db.GetStats();
         Assert.That(stats.ScaleUp, Is.EqualTo(0));
         Assert.That(stats.ScaleDown, Is.EqualTo(0));
         Assert.That(stats.Dropped, Is.EqualTo(0));
@@ -60,7 +60,7 @@ public class StreamDBStatsTests
         _db.Append(primaryIndex: 100, secondaryIndex: 1, version: 1, payload: bytes); // late
         _db.Append(primaryIndex: 50, secondaryIndex: 1, version: 1, payload: bytes);  // late
 
-        var stats = _db.GetStats();
+    StreamDbStats stats = _db.GetStats();
         Assert.That(stats.LateArrivals, Is.EqualTo(2));
     }
 }

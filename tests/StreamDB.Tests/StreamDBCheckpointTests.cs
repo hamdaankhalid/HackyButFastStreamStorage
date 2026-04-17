@@ -59,7 +59,7 @@ public class StreamDBCheckpointTests
         _db.WaitForPendingWrites();
         WaitForCheckpoint();
 
-        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 1000, endPrimaryIndex: 1099);
+    List<StreamEntry> results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 1000, endPrimaryIndex: 1099);
         Assert.That(results, Has.Count.EqualTo(100));
         Assert.That(results[0].PrimaryIndex, Is.EqualTo(1000));
         Assert.That(results[99].PrimaryIndex, Is.EqualTo(1099));
@@ -80,8 +80,8 @@ public class StreamDBCheckpointTests
 
         _db.WaitForPendingWrites();
 
-        var before = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 1000, endPrimaryIndex: 1049);
-        var after = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 2000, endPrimaryIndex: 2049);
+    List<StreamEntry> before = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 1000, endPrimaryIndex: 1049);
+    List<StreamEntry> after = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 2000, endPrimaryIndex: 2049);
 
         Assert.That(before, Has.Count.EqualTo(50));
         Assert.That(after, Has.Count.EqualTo(50));
@@ -108,9 +108,9 @@ public class StreamDBCheckpointTests
         _db.WaitForPendingWrites();
         WaitForCheckpoint();
 
-        var r1 = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 1000, endPrimaryIndex: 1049);
-        var r2 = _db.ReadRange(secondaryIndex: 2, startPrimaryIndex: 2000, endPrimaryIndex: 2049);
-        var r3 = _db.ReadRange(secondaryIndex: 3, startPrimaryIndex: 3000, endPrimaryIndex: 3049);
+    List<StreamEntry> r1 = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 1000, endPrimaryIndex: 1049);
+    List<StreamEntry> r2 = _db.ReadRange(secondaryIndex: 2, startPrimaryIndex: 2000, endPrimaryIndex: 2049);
+    List<StreamEntry> r3 = _db.ReadRange(secondaryIndex: 3, startPrimaryIndex: 3000, endPrimaryIndex: 3049);
 
         Assert.That(r1, Has.Count.EqualTo(50));
         Assert.That(r2, Has.Count.EqualTo(50));
@@ -136,8 +136,8 @@ public class StreamDBCheckpointTests
         writeTask.Wait();
         _db.WaitForPendingWrites();
 
-        var pre = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 1000, endPrimaryIndex: 1099);
-        var concurrent = _db.ReadRange(secondaryIndex: 2, startPrimaryIndex: 5000, endPrimaryIndex: 5199);
+    List<StreamEntry> pre = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 1000, endPrimaryIndex: 1099);
+    List<StreamEntry> concurrent = _db.ReadRange(secondaryIndex: 2, startPrimaryIndex: 5000, endPrimaryIndex: 5199);
 
         Assert.That(pre, Has.Count.EqualTo(100));
         Assert.That(concurrent, Has.Count.EqualTo(200));
@@ -157,7 +157,7 @@ public class StreamDBCheckpointTests
 
         WaitForCheckpoint();
 
-        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 500, endPrimaryIndex: 1009);
+    List<StreamEntry> results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 500, endPrimaryIndex: 1009);
         Assert.That(results, Has.Count.EqualTo(11));
         Assert.That(results[0].PrimaryIndex, Is.EqualTo(500), "Late arrival should appear first");
     }
@@ -172,13 +172,13 @@ public class StreamDBCheckpointTests
         _db.WaitForPendingWrites();
         WaitForCheckpoint();
 
-        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 1000, endPrimaryIndex: 1019);
+    List<StreamEntry> results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 1000, endPrimaryIndex: 1019);
         Assert.That(results, Has.Count.EqualTo(20));
 
         for (int i = 0; i < 20; i++)
         {
-            var entry = results[i];
-            var payload = MemoryMarshal.Read<TestPayload>(entry.Payload);
+      StreamEntry entry = results[i];
+      TestPayload payload = MemoryMarshal.Read<TestPayload>(entry.Payload);
             Assert.That(payload.Value, Is.EqualTo(i * 10.0f), $"Payload value mismatch at index {i}");
             Assert.That(payload.Counter, Is.EqualTo(1000 + i), $"Payload counter mismatch at index {i}");
         }

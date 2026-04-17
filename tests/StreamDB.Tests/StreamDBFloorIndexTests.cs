@@ -47,7 +47,7 @@ public class StreamDBFloorIndexTests
         AppendPayload(db, secondaryIndex: 42, primaryIndex: 1000);
         db.WaitForPendingWrites();
 
-        var results = db.ReadRange(secondaryIndex: 42, startPrimaryIndex: 1000, endPrimaryIndex: 1000);
+    List<StreamEntry> results = db.ReadRange(secondaryIndex: 42, startPrimaryIndex: 1000, endPrimaryIndex: 1000);
         Assert.That(results, Has.Count.EqualTo(1));
         Assert.That(results[0].PrimaryIndex, Is.EqualTo(1000));
     }
@@ -64,8 +64,8 @@ public class StreamDBFloorIndexTests
 
         db.WaitForPendingWrites();
 
-        // All should be readable via their respective backward index hits
-        var results = db.ReadRange(
+    // All should be readable via their respective backward index hits
+    Dictionary<int, List<StreamEntry>> results = db.ReadRange(
             Enumerable.Range(0, 10),
             startPrimaryIndex: 500,
             endPrimaryIndex: 509);
@@ -105,15 +105,15 @@ public class StreamDBFloorIndexTests
 
         db.WaitForPendingWrites();
 
-        // Verify all recent data is readable before retention
-        var beforeRetention = db.ReadRange(secondaryIndex: 1, startPrimaryIndex: recentPi, endPrimaryIndex: recentPi + 19);
+    // Verify all recent data is readable before retention
+    List<StreamEntry> beforeRetention = db.ReadRange(secondaryIndex: 1, startPrimaryIndex: recentPi, endPrimaryIndex: recentPi + 19);
         Assert.That(beforeRetention, Has.Count.EqualTo(20));
 
         // Run retention — should purge old data and re-insert floor entries
         db.RunRetention();
 
-        // Recent data should still be fully readable after retention
-        var afterRetention = db.ReadRange(secondaryIndex: 1, startPrimaryIndex: recentPi, endPrimaryIndex: recentPi + 19);
+    // Recent data should still be fully readable after retention
+    List<StreamEntry> afterRetention = db.ReadRange(secondaryIndex: 1, startPrimaryIndex: recentPi, endPrimaryIndex: recentPi + 19);
         Assert.That(afterRetention, Has.Count.EqualTo(20));
         Assert.That(afterRetention[0].PrimaryIndex, Is.EqualTo(recentPi));
     }
@@ -146,14 +146,14 @@ public class StreamDBFloorIndexTests
 
         db.RunRetention();
 
-        // All secondary indexes should still return recent data after retention
-        var results = db.ReadRange(
+    // All secondary indexes should still return recent data after retention
+    Dictionary<int, List<StreamEntry>> results = db.ReadRange(
             Enumerable.Range(0, 5),
             startPrimaryIndex: recentPi,
             endPrimaryIndex: recentPi + 19);
 
         Assert.That(results.Keys, Has.Count.EqualTo(5));
-        foreach (var (idx, entries) in results)
+        foreach ((int idx, List<StreamEntry>? entries) in results)
         {
             Assert.That(entries, Has.Count.EqualTo(20), $"Secondary index {idx} should have 20 entries after retention");
         }

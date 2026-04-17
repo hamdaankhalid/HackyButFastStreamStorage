@@ -56,7 +56,7 @@ public class StreamDBMultiIndexTests
         }
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(secondaryIndexes: new[] { 1, 2, 3 }, startPrimaryIndex: 100, endPrimaryIndex: 119);
+    Dictionary<int, List<StreamEntry>> results = _db.ReadRange(secondaryIndexes: new[] { 1, 2, 3 }, startPrimaryIndex: 100, endPrimaryIndex: 119);
         Assert.That(results.Keys, Has.Count.EqualTo(3));
         Assert.That(results[1], Has.Count.EqualTo(20));
         Assert.That(results[2], Has.Count.EqualTo(20));
@@ -72,7 +72,7 @@ public class StreamDBMultiIndexTests
             AppendPayload(2, 150 + i * 10);
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(secondaryIndexes: new[] { 1, 2 }, startPrimaryIndex: 100, endPrimaryIndex: 300);
+    Dictionary<int, List<StreamEntry>> results = _db.ReadRange(secondaryIndexes: new[] { 1, 2 }, startPrimaryIndex: 100, endPrimaryIndex: 300);
         Assert.That(results[1], Has.Count.EqualTo(20));
         Assert.That(results[2], Has.Count.EqualTo(16)); // pi 150..300
     }
@@ -88,7 +88,7 @@ public class StreamDBMultiIndexTests
         }
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(startPrimaryIndex: 0, endPrimaryIndex: 200);
+    Dictionary<int, List<StreamEntry>> results = _db.ReadRange(startPrimaryIndex: 0, endPrimaryIndex: 200);
         Assert.That(results.Keys, Has.Count.EqualTo(3));
     }
 
@@ -99,7 +99,7 @@ public class StreamDBMultiIndexTests
             AppendPayload(1, 100 + i);
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(secondaryIndexes: new[] { 1 }, startPrimaryIndex: 100, endPrimaryIndex: 200, limit: 3);
+    Dictionary<int, List<StreamEntry>> results = _db.ReadRange(secondaryIndexes: new[] { 1 }, startPrimaryIndex: 100, endPrimaryIndex: 200, limit: 3);
         Assert.That(results[1], Has.Count.EqualTo(3));
     }
 }

@@ -560,7 +560,7 @@ namespace StreamDB
             List<StreamEntry>? lateEntries = null;
             if (Volatile.Read(ref _lateArrivalCount) > 0)
             {
-                var late = _lateArrivals.QueryRange(secondaryIndex, startPrimaryIndex, endPrimaryIndex);
+                List<StreamEntry> late = _lateArrivals.QueryRange(secondaryIndex, startPrimaryIndex, endPrimaryIndex);
                 if (late.Count > 0)
                     lateEntries = late;
             }
@@ -636,7 +636,7 @@ namespace StreamDB
                 if (addr == 0)
                 {
                     // No backward hit: use forward lookup to check if this index has any data at all.
-                    var forward = LookupFirstAddressAtOrAfter(idx, startPrimaryIndex);
+                    (long PrimaryIndex, long Address)? forward = LookupFirstAddressAtOrAfter(idx, startPrimaryIndex);
                     if (!forward.HasValue)
                     {
                         _logger?.LogDebug("ReadRange (multi-index): skipping secondaryIndex={SecondaryIndex} — no indexed data", idx);
@@ -771,7 +771,7 @@ namespace StreamDB
                 else
                 {
                     // No backward hit: use forward lookup to check if device has any indexed data.
-                    var forward = LookupFirstAddressAtOrAfter(idx, fromPrimaryIndex);
+                    (long PrimaryIndex, long Address)? forward = LookupFirstAddressAtOrAfter(idx, fromPrimaryIndex);
                     if (forward.HasValue)
                     {
                         // Forward hit exists but no backward hit. Floor indexing should prevent

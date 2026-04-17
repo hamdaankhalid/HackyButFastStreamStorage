@@ -138,7 +138,7 @@ public class DeferrableRwLock : IDisposable
 
   private bool IsUnsafeSessionActive()
   {
-    foreach (var counter in _threadUnsafeSessionRefs.Values)
+    foreach (ThreadSessionCounter counter in _threadUnsafeSessionRefs.Values)
     {
       if (Volatile.Read(ref counter.Count) > 0)
         return true;

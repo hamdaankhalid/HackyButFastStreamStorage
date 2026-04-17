@@ -90,3 +90,9 @@ See the [`docs/`](docs/) directory for detailed technical documentation:
 
 [Apache 2.0](LICENSE)
 
+
+
+## TODO:
+- SkipList truncation issue
+- Add ability to call save/flush without removing skiplist from memory
+- InMemory queries are too slow

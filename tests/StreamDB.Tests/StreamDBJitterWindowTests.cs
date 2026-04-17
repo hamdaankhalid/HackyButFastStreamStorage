@@ -54,12 +54,12 @@ public class StreamDBJitterWindowTests
 
         _db.WaitForPendingWrites();
 
-        var stats = _db.GetStats();
+    StreamDbStats stats = _db.GetStats();
         Assert.That(stats.LateArrivals, Is.EqualTo(0), "Should NOT be a late arrival");
         Assert.That(stats.JitterAbsorbed, Is.EqualTo(1), "Should be absorbed by jitter window");
 
-        // Verify it appears in ReadRange
-        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 960, endPrimaryIndex: 1010);
+    // Verify it appears in ReadRange
+    List<StreamEntry> results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 960, endPrimaryIndex: 1010);
         Assert.That(results, Has.Count.EqualTo(2));
         Assert.That(results.Any(e => e.PrimaryIndex == 970), Is.True, "Jitter entry should be readable");
         Assert.That(results.Any(e => e.PrimaryIndex == 1000), Is.True, "Normal entry should be readable");
@@ -74,12 +74,12 @@ public class StreamDBJitterWindowTests
 
         _db.WaitForPendingWrites();
 
-        var stats = _db.GetStats();
+    StreamDbStats stats = _db.GetStats();
         Assert.That(stats.LateArrivals, Is.EqualTo(1), "Should be a late arrival");
         Assert.That(stats.JitterAbsorbed, Is.EqualTo(0), "Should NOT be absorbed by jitter window");
 
-        // Verify it still appears in ReadRange (via late arrivals merge)
-        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 890, endPrimaryIndex: 1010);
+    // Verify it still appears in ReadRange (via late arrivals merge)
+    List<StreamEntry> results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 890, endPrimaryIndex: 1010);
         Assert.That(results, Has.Count.EqualTo(2));
         Assert.That(results.Any(e => e.PrimaryIndex == 900), Is.True, "Late arrival should be readable");
     }
@@ -95,7 +95,7 @@ public class StreamDBJitterWindowTests
 
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 975, endPrimaryIndex: 1005);
+    List<StreamEntry> results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 975, endPrimaryIndex: 1005);
         Assert.That(results, Has.Count.EqualTo(3)); // 980, 990, 1000
 
         // Verify entries are present (they may not be in perfect order since FasterLog is append-order)
@@ -114,7 +114,7 @@ public class StreamDBJitterWindowTests
         AppendPayload(1, 940); // beyond jitter (1000 - 940 = 60 > 50), late arrival
         AppendPayload(1, 500); // beyond jitter (1000 - 500 = 500 > 50), late arrival
 
-        var stats = _db.GetStats();
+    StreamDbStats stats = _db.GetStats();
         Assert.That(stats.JitterAbsorbed, Is.EqualTo(2), "Two writes should be absorbed by jitter window");
         Assert.That(stats.LateArrivals, Is.EqualTo(2), "Two writes should be late arrivals");
     }
@@ -128,7 +128,7 @@ public class StreamDBJitterWindowTests
 
         _db.WaitForPendingWrites();
 
-        var stats = _db.GetStats();
+    StreamDbStats stats = _db.GetStats();
         Assert.That(stats.JitterAbsorbed, Is.EqualTo(1), "Exact boundary should be absorbed");
         Assert.That(stats.LateArrivals, Is.EqualTo(0), "Should NOT be a late arrival");
     }
@@ -142,7 +142,7 @@ public class StreamDBJitterWindowTests
 
         _db.WaitForPendingWrites();
 
-        var stats = _db.GetStats();
+    StreamDbStats stats = _db.GetStats();
         Assert.That(stats.JitterAbsorbed, Is.EqualTo(0), "Should NOT be absorbed");
         Assert.That(stats.LateArrivals, Is.EqualTo(1), "Should be a late arrival");
     }

@@ -58,7 +58,7 @@ public class StreamDBReadLatestTests
         }
 
         _db.WaitForPendingWrites();
-        var latest = _db.ReadLatest();
+    Dictionary<int, StreamEntry> latest = _db.ReadLatest();
 
         Assert.That(latest, Has.Count.EqualTo(2));
         Assert.That(latest[1].PrimaryIndex, Is.EqualTo(1000 + 2047));
@@ -75,7 +75,7 @@ public class StreamDBReadLatestTests
         // Late arrival with lower primary index — shouldn't override the latest
         AppendPayload(1, 1500);
 
-        var latest = _db.ReadLatest();
+    Dictionary<int, StreamEntry> latest = _db.ReadLatest();
         Assert.That(latest[1].PrimaryIndex, Is.EqualTo(1000 + 2047));
     }
 }

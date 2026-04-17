@@ -58,7 +58,7 @@ public class StreamDBConcurrencyTests
 
         for (int idx = 0; idx < indexCount; idx++)
         {
-            var results = _db.ReadRange(secondaryIndex: idx, startPrimaryIndex: 1000, endPrimaryIndex: 1999);
+      List<StreamEntry> results = _db.ReadRange(secondaryIndex: idx, startPrimaryIndex: 1000, endPrimaryIndex: 1999);
             Assert.That(results, Has.Count.EqualTo(writesPerIndex),
                 $"Secondary index {idx} should have {writesPerIndex} entries");
         }

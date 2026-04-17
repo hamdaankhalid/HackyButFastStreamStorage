@@ -21,12 +21,16 @@ internal sealed class SegmentCache : IDisposable
     public MemoryMappedFile Mmf { get; }
     public MemoryMappedViewAccessor Accessor { get; }
     public int Count { get; }
+    public long FlagsOffset { get; } // offset to flags byte array within the block
+    public long DataOffset { get; }  // offset to first KV entry within the block
 
-    public CachedSegment(MemoryMappedFile mmf, MemoryMappedViewAccessor accessor, int count)
+    public CachedSegment(MemoryMappedFile mmf, MemoryMappedViewAccessor accessor, int count, long flagsOffset, long dataOffset)
     {
       Mmf = mmf;
       Accessor = accessor;
       Count = count;
+      FlagsOffset = flagsOffset;
+      DataOffset = dataOffset;
     }
 
     public void Dispose()
@@ -49,7 +53,7 @@ internal sealed class SegmentCache : IDisposable
   {
     lock (_lock)
     {
-      if (_cache.TryGetValue(segmentIndex, out var entry))
+      if (_cache.TryGetValue(segmentIndex, out (LinkedListNode<int> Node, CachedSegment Segment) entry))
       {
         // Move to end (most recently used)
         _lruOrder.Remove(entry.Node);
@@ -59,14 +63,14 @@ internal sealed class SegmentCache : IDisposable
     }
 
     // Create outside lock to avoid holding it during I/O
-    var segment = factory(segmentIndex);
+    CachedSegment? segment = factory(segmentIndex);
     if (segment == null)
       return null;
 
     lock (_lock)
     {
       // Double-check: another thread may have cached it
-      if (_cache.TryGetValue(segmentIndex, out var existing))
+      if (_cache.TryGetValue(segmentIndex, out (LinkedListNode<int> Node, CachedSegment Segment) existing))
       {
         segment.Dispose();
         _lruOrder.Remove(existing.Node);
@@ -79,13 +83,13 @@ internal sealed class SegmentCache : IDisposable
       {
         var evictKey = _lruOrder.First.Value;
         _lruOrder.RemoveFirst();
-        if (_cache.Remove(evictKey, out var evicted))
+        if (_cache.Remove(evictKey, out (LinkedListNode<int> Node, CachedSegment Segment) evicted))
         {
           evicted.Segment.Dispose();
         }
       }
 
-      var node = _lruOrder.AddLast(segmentIndex);
+      LinkedListNode<int> node = _lruOrder.AddLast(segmentIndex);
       _cache[segmentIndex] = (node, segment);
       return segment;
     }
@@ -98,7 +102,7 @@ internal sealed class SegmentCache : IDisposable
   {
     lock (_lock)
     {
-      if (_cache.Remove(segmentIndex, out var entry))
+      if (_cache.Remove(segmentIndex, out (LinkedListNode<int> Node, CachedSegment Segment) entry))
       {
         _lruOrder.Remove(entry.Node);
         entry.Segment.Dispose();
@@ -110,7 +114,7 @@ internal sealed class SegmentCache : IDisposable
   {
     lock (_lock)
     {
-      foreach (var (_, entry) in _cache)
+      foreach ((int _, (LinkedListNode<int> Node, CachedSegment Segment) entry) in _cache)
       {
         entry.Segment.Dispose();
       }

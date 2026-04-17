@@ -48,7 +48,7 @@ public class StreamDBReadRangeFromAvailableTests
     [Test]
     public void ReadRangeFromAvailable_NoData_ReturnsNegativeOne()
     {
-        var (rangeEnd, data) = _db.ReadRangeFromAvailable(new[] { 1 }, fromPrimaryIndex: 0, window: 100);
+        (long rangeEnd, Dictionary<int, List<StreamEntry>>? data) = _db.ReadRangeFromAvailable(new[] { 1 }, fromPrimaryIndex: 0, window: 100);
         Assert.That(rangeEnd, Is.EqualTo(-1));
         Assert.That(data, Is.Empty);
     }
@@ -62,11 +62,11 @@ public class StreamDBReadRangeFromAvailableTests
 
         // With initialAdaptiveIdx=0 (spacing=16), first index at count=16 → pi=250.
         // Query from 0: forward lookup finds pi=250, scan from 0 finds pi=100 as earliest.
-        var (rangeEnd, data) = _db.ReadRangeFromAvailable(new[] { 1 }, fromPrimaryIndex: 100, window: 50);
+        (long rangeEnd, Dictionary<int, List<StreamEntry>>? data) = _db.ReadRangeFromAvailable(new[] { 1 }, fromPrimaryIndex: 100, window: 50);
         Assert.That(rangeEnd, Is.EqualTo(150));
         Assert.That(data[1], Has.Count.GreaterThan(0));
 
-        foreach (var entry in data[1])
+        foreach (StreamEntry entry in data[1])
             Assert.That(entry.PrimaryIndex, Is.InRange(100, 150));
     }
 
@@ -90,7 +90,7 @@ public class StreamDBReadRangeFromAvailableTests
         _db.WaitForPendingWrites();
 
         // Query from primary index 0 with a small window — should find device 1's old data
-        var (rangeEnd, data) = _db.ReadRangeFromAvailable(
+        (long rangeEnd, Dictionary<int, List<StreamEntry>>? data) = _db.ReadRangeFromAvailable(
             new[] { 1, 5, 9, 13 }, fromPrimaryIndex: 0, window: 3000);
 
         Assert.That(rangeEnd, Is.GreaterThan(-1), "Should find data");
@@ -99,7 +99,7 @@ public class StreamDBReadRangeFromAvailableTests
         // Device 1 should have entries in range
         Assert.That(data.ContainsKey(1), Is.True, "Device 1 should have data in range");
         Assert.That(data[1], Has.Count.GreaterThan(0));
-        foreach (var entry in data[1])
+        foreach (StreamEntry entry in data[1])
             Assert.That(entry.PrimaryIndex, Is.InRange(0, rangeEnd));
 
         // Devices 5, 9, 13 should NOT have entries (their data is at 1M+, far beyond the window)
@@ -127,7 +127,7 @@ public class StreamDBReadRangeFromAvailableTests
 
         _db.WaitForPendingWrites();
 
-        var (rangeEnd, data) = _db.ReadRangeFromAvailable(
+        (long rangeEnd, Dictionary<int, List<StreamEntry>>? data) = _db.ReadRangeFromAvailable(
             new[] { 0, 4 }, fromPrimaryIndex: 0, window: 3000);
 
         Assert.That(rangeEnd, Is.GreaterThan(-1));

@@ -6,6 +6,8 @@
     <Nullable>enable</Nullable>
     <RootNamespace>StreamDB</RootNamespace>
 
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    
     <!-- NuGet package metadata -->
     <PackageId>StreamDB</PackageId>
     <Version>1.0.1</Version>

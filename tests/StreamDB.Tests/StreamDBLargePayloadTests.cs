@@ -46,7 +46,7 @@ public class StreamDBLargePayloadTests
         _db.Append(primaryIndex: 100, secondaryIndex: 1, version: 1, payload: largePayload);
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 100);
+    List<StreamEntry> results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 100);
         Assert.That(results, Has.Count.EqualTo(1));
         Assert.That(results[0].Payload, Is.EqualTo(largePayload));
     }
@@ -57,7 +57,7 @@ public class StreamDBLargePayloadTests
         _db.Append(primaryIndex: 100, secondaryIndex: 1, version: 1, payload: ReadOnlySpan<byte>.Empty);
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 100);
+    List<StreamEntry> results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 100);
         Assert.That(results, Has.Count.EqualTo(1));
         Assert.That(results[0].Payload, Is.Empty);
     }

@@ -52,7 +52,7 @@ public class StreamDBLateArrivalsTests
         AppendPayload(1, 200);
         AppendPayload(1, 150); // late arrival
 
-        var stats = _db.GetStats();
+    StreamDbStats stats = _db.GetStats();
         Assert.That(stats.LateArrivals, Is.EqualTo(1));
     }
 
@@ -65,7 +65,7 @@ public class StreamDBLateArrivalsTests
         AppendPayload(1, 150); // late arrival
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 300);
+    List<StreamEntry> results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 300);
         Assert.That(results, Has.Count.EqualTo(4));
 
         // Verify primary index ordering
@@ -95,10 +95,10 @@ public class StreamDBLateArrivalsTests
         AppendPayload(1, 125);
         _db.WaitForPendingWrites();
 
-        var stats = _db.GetStats();
+    StreamDbStats stats = _db.GetStats();
         Assert.That(stats.LateArrivals, Is.EqualTo(3));
 
-        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 200);
+    List<StreamEntry> results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 200);
         Assert.That(results, Has.Count.EqualTo(13));
 
         // Verify ordering
@@ -114,7 +114,7 @@ public class StreamDBLateArrivalsTests
         AppendPayload(1, 200); // late arrival
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 300, limit: 2);
+    List<StreamEntry> results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 300, limit: 2);
         Assert.That(results, Has.Count.EqualTo(2));
         Assert.That(results[0].PrimaryIndex, Is.EqualTo(100));
         Assert.That(results[1].PrimaryIndex, Is.EqualTo(200)); // late arrival comes before 300
@@ -130,7 +130,7 @@ public class StreamDBLateArrivalsTests
         AppendPayload(2, 100);
         AppendPayload(2, 200);
 
-        var stats = _db.GetStats();
+    StreamDbStats stats = _db.GetStats();
         Assert.That(stats.LateArrivals, Is.EqualTo(1)); // only 1 late arrival
     }
 
@@ -143,7 +143,7 @@ public class StreamDBLateArrivalsTests
         AppendPayload(1, 200);
         AppendPayload(1, 100, value: 99.9f); // late arrival with distinctive value
 
-        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 200);
+    List<StreamEntry> results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 200);
         Assert.That(results, Has.Count.EqualTo(2));
 
         // The late arrival should be first (pi=100)
@@ -165,7 +165,7 @@ public class StreamDBLateArrivalsTests
         AppendPayload(2, 50);
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(secondaryIndexes: new[] { 1, 2 }, startPrimaryIndex: 50, endPrimaryIndex: 119);
+    Dictionary<int, List<StreamEntry>> results = _db.ReadRange(secondaryIndexes: new[] { 1, 2 }, startPrimaryIndex: 50, endPrimaryIndex: 119);
         Assert.That(results[1], Has.Count.EqualTo(21));
         Assert.That(results[2], Has.Count.EqualTo(21));
 
@@ -182,7 +182,7 @@ public class StreamDBLateArrivalsTests
         AppendPayload(1, 200); // late
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(startPrimaryIndex: 100, endPrimaryIndex: 300);
+    Dictionary<int, List<StreamEntry>> results = _db.ReadRange(startPrimaryIndex: 100, endPrimaryIndex: 300);
         Assert.That(results[1], Has.Count.EqualTo(3));
         Assert.That(results[1][1].PrimaryIndex, Is.EqualTo(200));
     }
@@ -197,7 +197,7 @@ public class StreamDBLateArrivalsTests
         // Actually, since pi=100 < maxPi=200, this is also a late arrival
         _db.WaitForPendingWrites();
 
-        var results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 200);
+    List<StreamEntry> results = _db.ReadRange(secondaryIndex: 1, startPrimaryIndex: 100, endPrimaryIndex: 200);
         Assert.That(results, Has.Count.EqualTo(2));
     }
 
@@ -220,9 +220,9 @@ public class StreamDBLateArrivalsTests
 
         _db.WaitForPendingWrites();
 
-        // Each index has 15 total entries (10 normal + 5 late arrivals)
-        // With limit=3, each secondary index should return at most 3 entries
-        var results = _db.ReadRange(new[] { 1, 2 }, startPrimaryIndex: 0, endPrimaryIndex: 2000, limit: 3);
+    // Each index has 15 total entries (10 normal + 5 late arrivals)
+    // With limit=3, each secondary index should return at most 3 entries
+    Dictionary<int, List<StreamEntry>> results = _db.ReadRange(new[] { 1, 2 }, startPrimaryIndex: 0, endPrimaryIndex: 2000, limit: 3);
 
         Assert.That(results[1], Has.Count.EqualTo(3), "Index 1 should respect per-index limit");
         Assert.That(results[2], Has.Count.EqualTo(3), "Index 2 should respect per-index limit");
