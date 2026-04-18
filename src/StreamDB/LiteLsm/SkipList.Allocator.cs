@@ -157,18 +157,17 @@ public sealed unsafe partial class SkipList<TKey, TValue> : IDisposable
   #region Node Memory Management (Circular Buffer)
 
   private CircularBufferAllocator<Node> _nodeAllocator;
-  private bool disposedValue;
 
   struct Node
   {
     public TKey key;
     public fixed long levelPtrs[16];
     public long DataIdx;
-    internal int _Id;
-    public readonly int Id => _Id;
   }
 
   #endregion
+
+  private bool disposedValue;
 
   internal void InitializeAllocator()
   {

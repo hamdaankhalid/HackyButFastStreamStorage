@@ -119,12 +119,12 @@ public unsafe sealed partial class SkipList<TKey, TValue> : IDisposable
             if (_tailsPerLevel[i] != default)
             {
                 Node* currTailNodePtr = _tailsPerLevel[i];
-                currTailNodePtr->levelPtrs[i] = (long)node;
+                // Volatile.Write ensures readers see consistent node data before the pointer
+                Volatile.Write(ref currTailNodePtr->levelPtrs[i], (long)node);
             }
             else
             {
-                // First node at this level - link from head
-                _dummyHead->levelPtrs[i] = (long)node;
+                Volatile.Write(ref _dummyHead->levelPtrs[i], (long)node);
             }
             _tailsPerLevel[i] = node;
         }
@@ -174,9 +174,11 @@ public unsafe sealed partial class SkipList<TKey, TValue> : IDisposable
         Node* currNode = _dummyHead;
         for (int i = MaxLevel - 1; i > -1; i--)
         {
-            while (currNode != default && currNode->levelPtrs[i] != 0)
+            while (currNode != default)
             {
-                Node* next = (Node*)currNode->levelPtrs[i];
+                long nextPtr = Volatile.Read(ref currNode->levelPtrs[i]);
+                if (nextPtr == 0) break;
+                Node* next = (Node*)nextPtr;
                 if (next->key.CompareTo(key) < 0)
                 {
                     currNode = next;
@@ -187,19 +189,22 @@ public unsafe sealed partial class SkipList<TKey, TValue> : IDisposable
                 }
                 else
                 {
-                    break; // next->key > key, drop to lower level
+                    break;
                 }
             }
         }
 
         // Key not found - return bitwise complement of insertion point
-        if (currNode->levelPtrs[0] != 0)
         {
-            Node* next = (Node*)currNode->levelPtrs[0];
-            return ~next->DataIdx;
+            long nextPtr = Volatile.Read(ref currNode->levelPtrs[0]);
+            if (nextPtr != 0)
+            {
+                Node* next = (Node*)nextPtr;
+                return ~next->DataIdx;
+            }
         }
 
-        return ~(long)_serializedDataAllocator.TailAddress; // past-end logical index
+        return ~(long)_serializedDataAllocator.TailAddress;
     }
 
     private int RandomLevel()
@@ -253,6 +258,19 @@ public unsafe sealed partial class SkipList<TKey, TValue> : IDisposable
     /// </summary>
     public int TruncatePrefix(in TKey beforeKey)
     {
+        int count = CountPrefix(beforeKey);
+        if (count > 0)
+        {
+            EvictPrefix(count);
+        }
+        return count;
+    }
+
+    /// <summary>
+    /// Counts entries with keys strictly less than beforeKey. Does not mutate.
+    /// </summary>
+    public int CountPrefix(in TKey beforeKey)
+    {
         if (Count == 0)
             return 0;
 
@@ -260,7 +278,6 @@ public unsafe sealed partial class SkipList<TKey, TValue> : IDisposable
         if (minKey.CompareTo(beforeKey) >= 0)
             return 0;
 
-        // Walk from head counting entries < beforeKey
         int truncateCount = 0;
         int capacity = _maxEntries;
         int idx = _serializedDataAllocator.FirstLogicalAddress;
@@ -271,11 +288,6 @@ public unsafe sealed partial class SkipList<TKey, TValue> : IDisposable
                 break;
             truncateCount++;
             idx = (idx + 1) % capacity;
-        }
-
-        if (truncateCount > 0)
-        {
-            EvictPrefix(truncateCount);
         }
 
         return truncateCount;

@@ -752,4 +752,171 @@ public class LiteLsmTests
     }
 
     #endregion
+
+    #region Concurrency Tests
+
+    [Test]
+    public void ConcurrentReaders_WhileWriterEvicts_AllReadsConsistent()
+    {
+        var lsm = CreateLsm<long, long>();
+        const int writerCount = 5000; // enough to trigger multiple evictions
+        var errors = new System.Collections.Concurrent.ConcurrentBag<string>();
+        var writerDone = new ManualResetEventSlim(false);
+        long highWaterMark = 0;
+
+        // Writer thread
+        var writer = Task.Run(() =>
+        {
+            for (long i = 1; i <= writerCount; i++)
+            {
+                lsm.Put(i, i * 10);
+                Volatile.Write(ref highWaterMark, i);
+            }
+            writerDone.Set();
+        });
+
+        // Reader threads doing point reads
+        var readers = Enumerable.Range(0, 4).Select(_ => Task.Run(() =>
+        {
+            var rng = new Random();
+            while (!writerDone.IsSet || Volatile.Read(ref highWaterMark) < writerCount)
+            {
+                long hwm = Volatile.Read(ref highWaterMark);
+                if (hwm < 1) continue;
+
+                long key = rng.NextInt64(1, hwm + 1);
+                if (lsm.TryGet(key, out long value))
+                {
+                    if (value != key * 10)
+                    {
+                        errors.Add($"Key {key}: expected {key * 10}, got {value}");
+                    }
+                }
+                // Key not found is OK -- it may have been evicted mid-read
+            }
+        })).ToArray();
+
+        Task.WaitAll([writer, .. readers]);
+
+        Assert.That(errors, Is.Empty,
+            $"Found {errors.Count} errors:\n{string.Join("\n", errors.Take(10))}");
+    }
+
+    [Test]
+    public void ConcurrentReaders_WhileWriterTruncates_NoCorruption()
+    {
+        var lsm = CreateLsm<long, long>();
+        var errors = new System.Collections.Concurrent.ConcurrentBag<string>();
+        var done = new ManualResetEventSlim(false);
+        long highWaterMark = 0;
+
+        // Writer: insert then periodically truncate
+        var writer = Task.Run(() =>
+        {
+            for (long i = 1; i <= 3000; i++)
+            {
+                lsm.Put(i, i * 7);
+                Volatile.Write(ref highWaterMark, i);
+
+                if (i % 500 == 0)
+                {
+                    lsm.Truncate(i - 200);
+                }
+            }
+            done.Set();
+        });
+
+        // Readers: range reads via iterators
+        var readers = Enumerable.Range(0, 3).Select(_ => Task.Run(() =>
+        {
+            while (!done.IsSet)
+            {
+                long hwm = Volatile.Read(ref highWaterMark);
+                if (hwm < 10) continue;
+
+                try
+                {
+                    using var iter = lsm.GetIterator(Math.Max(1, hwm - 50), hwm);
+                    long? prevKey = null;
+                    foreach (var kvp in iter.ReadAll())
+                    {
+                        if (prevKey.HasValue && kvp.Key <= prevKey.Value)
+                        {
+                            errors.Add($"Non-monotonic: {prevKey.Value} -> {kvp.Key}");
+                            break;
+                        }
+                        if (kvp.Value != kvp.Key * 7)
+                        {
+                            errors.Add($"Wrong value for key {kvp.Key}: {kvp.Value}");
+                            break;
+                        }
+                        prevKey = kvp.Key;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    errors.Add($"Exception: {ex.GetType().Name}: {ex.Message}");
+                }
+            }
+        })).ToArray();
+
+        Task.WaitAll([writer, .. readers]);
+
+        Assert.That(errors, Is.Empty,
+            $"Found {errors.Count} errors:\n{string.Join("\n", errors.Take(10))}");
+    }
+
+    [Test]
+    public void ConcurrentReaders_WithDeletes_NoCorruption()
+    {
+        var lsm = CreateLsm<long, long>();
+        var errors = new System.Collections.Concurrent.ConcurrentBag<string>();
+        var done = new ManualResetEventSlim(false);
+        long highWaterMark = 0;
+
+        // Writer: insert, then delete some
+        var writer = Task.Run(() =>
+        {
+            for (long i = 1; i <= 2000; i++)
+            {
+                lsm.Put(i, i * 3);
+                Volatile.Write(ref highWaterMark, i);
+
+                // Delete every 100th entry
+                if (i > 100 && i % 100 == 0)
+                {
+                    lsm.Delete(i - 50);
+                }
+            }
+            done.Set();
+        });
+
+        // Readers: point reads
+        var readers = Enumerable.Range(0, 4).Select(_ => Task.Run(() =>
+        {
+            var rng = new Random();
+            while (!done.IsSet)
+            {
+                long hwm = Volatile.Read(ref highWaterMark);
+                if (hwm < 1) continue;
+
+                long key = rng.NextInt64(1, hwm + 1);
+                if (lsm.TryGet(key, out long value))
+                {
+                    // If found, value must be correct
+                    if (value != key * 3)
+                    {
+                        errors.Add($"Key {key}: expected {key * 3}, got {value}");
+                    }
+                }
+            }
+        })).ToArray();
+
+        Task.WaitAll([writer, .. readers]);
+
+        Assert.That(errors, Is.Empty,
+            $"Found {errors.Count} errors:\n{string.Join("\n", errors.Take(10))}");
+    }
+
+    #endregion
 }
